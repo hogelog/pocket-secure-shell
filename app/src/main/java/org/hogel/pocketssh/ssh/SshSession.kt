@@ -6,6 +6,7 @@ import com.trilead.ssh2.SCPClient
 import com.trilead.ssh2.ServerHostKeyVerifier
 import com.trilead.ssh2.Session
 import com.trilead.ssh2.auth.SignatureProxy
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import org.hogel.pocketssh.tmux.TmuxTitle
@@ -160,6 +161,36 @@ class SshSession(
         try {
             while (input.read(buf) > 0) { /* discard */ }
         } catch (_: Exception) { /* channel closed */ }
+    }
+
+    /**
+     * Like [execCommand] but returns the command's stdout instead of discarding
+     * it. Reads stdout to EOF, drains stderr, and waits for the remote to exit
+     * (or [timeoutMs] to elapse). The interactive shell session is unaffected.
+     * Call from a background thread.
+     */
+    fun execCapture(command: String, timeoutMs: Long = 5_000): ByteArray {
+        val conn = connection ?: throw IllegalStateException("Not connected")
+        val sess = conn.openSession()
+        try {
+            sess.execCommand(command)
+            val out = ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            val stdout = sess.stdout
+            while (true) {
+                val n = stdout.read(buf)
+                if (n < 0) break
+                out.write(buf, 0, n)
+            }
+            drain(sess.stderr)
+            sess.waitForCondition(
+                ChannelCondition.EXIT_STATUS or ChannelCondition.CLOSED,
+                timeoutMs,
+            )
+            return out.toByteArray()
+        } finally {
+            try { sess.close() } catch (_: Exception) {}
+        }
     }
 
     /** Send an SSH_MSG_IGNORE packet to keep NAT/firewall mappings warm. */

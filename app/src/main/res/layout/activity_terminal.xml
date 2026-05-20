@@ -32,6 +32,13 @@
                 android:layout_width="match_parent"
                 android:layout_height="match_parent" />
 
+            <com.termux.view.TerminalView
+                android:id="@+id/scrollback_overlay_view"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:background="@color/terminal_background"
+                android:visibility="invisible" />
+
             <TextView
                 android:id="@+id/swipe_feedback"
                 android:layout_width="wrap_content"

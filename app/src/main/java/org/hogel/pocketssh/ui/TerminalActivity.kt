@@ -88,6 +88,8 @@ class TerminalActivity : AppCompatActivity() {
     private var service: SshConnectionService? = null
     private var bound = false
 
+    private lateinit var scrollbackOverlay: ScrollbackOverlay
+
     private var pendingParams: SshConnectionService.ConnectionParams? = null
     // Pending tmux window from a deeplink intent. Set in onCreate / onNewIntent,
     // cleared after execTmuxSelectWindow fires (whether cold-start once SSH
@@ -474,6 +476,10 @@ class TerminalActivity : AppCompatActivity() {
         applyWindowList(emptyList())
         binding.windowTabsNew.setOnClickListener { openNewTmuxWindow() }
         binding.fabMain.setOnClickListener { setFabExpanded(!fabExpanded) }
+        // TEMPORARY (scrollback overlay M1): long-press the menu FAB to capture
+        // the tmux pane and show the native-scroll overlay. M2 replaces this
+        // with a scroll gesture in setupTerminalScrollRouting.
+        binding.fabMain.setOnLongClickListener { captureAndShowScrollback(); true }
         setFabExpanded(false)
         binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
         // Initial sync so the IME proxy / badge visibility match the
@@ -1207,6 +1213,19 @@ private fun styleModifierButton(button: Button) {
         terminalView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             service?.let { syncWindowSize(it) }
         }
+
+        scrollbackOverlay = ScrollbackOverlay(binding.scrollbackOverlayView)
+    }
+
+    private fun captureAndShowScrollback() {
+        val svc = service ?: return
+        setFabExpanded(false)
+        svc.capturePaneHistory(
+            onResult = { bytes -> scrollbackOverlay.show(bytes, fontSizePx) },
+            onError = {
+                Toast.makeText(this, R.string.scrollback_capture_failed, Toast.LENGTH_SHORT).show()
+            },
+        )
     }
 
     private fun wireImeProxy() {

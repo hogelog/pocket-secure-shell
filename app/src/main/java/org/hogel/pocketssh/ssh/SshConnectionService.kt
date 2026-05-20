@@ -428,6 +428,30 @@ class SshConnectionService : Service() {
         }, "tmux-select-window").apply { isDaemon = true }.start()
     }
 
+    /**
+     * Capture the tmux pane's full history (`capture-pane -peJ -S -`, with SGR
+     * colours and wrapped lines joined) over a separate SSH session, off the
+     * main thread, and deliver the raw bytes on the main thread. Used to render
+     * a native-scrollable scrollback overlay. Failures (not connected, not in
+     * tmux, timeout) report via [onError]; the live session is unaffected.
+     */
+    fun capturePaneHistory(onResult: (ByteArray) -> Unit, onError: (Throwable) -> Unit) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onError(IllegalStateException("Not connected")) }
+            return
+        }
+        Thread({
+            try {
+                val bytes = ssh.execCapture("tmux capture-pane -peJ -t pocketssh -S -")
+                mainHandler.post { onResult(bytes) }
+            } catch (t: Throwable) {
+                Log.e(TAG, "tmux capture-pane failed", t)
+                mainHandler.post { onError(t) }
+            }
+        }, "tmux-capture-pane").apply { isDaemon = true }.start()
+    }
+
     private fun shellQuote(value: String): String =
         "'" + value.replace("'", "'\\''") + "'"
 
