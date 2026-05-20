@@ -1182,11 +1182,11 @@ private fun styleModifierButton(button: Button) {
 
     private fun setupTerminalView() {
         val terminalView = binding.terminalView
-        scrollbackOverlay = ScrollbackOverlay(binding.scrollbackOverlayView)
         fontSizePx = terminalPrefs.getInt(KEY_FONT_SIZE_PX, DEFAULT_FONT_SIZE_PX)
             .coerceIn(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         terminalView.setTextSize(fontSizePx)
         terminalView.setTypeface(Typeface.MONOSPACE)
+        scrollbackOverlay = ScrollbackOverlay(binding.scrollbackOverlayView, fontSizePx)
 
         // Create a dummy TerminalSession to initialize TerminalView.
         // "sleep 86400" keeps the process alive without producing output.

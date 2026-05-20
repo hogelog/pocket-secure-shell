@@ -23,7 +23,10 @@ import java.io.ByteArrayOutputStream
  * Nothing typed here reaches the remote: the view client swallows all key /
  * code-point input and a single tap dismisses the overlay.
  */
-class ScrollbackOverlay(private val terminalView: TerminalView) {
+class ScrollbackOverlay(
+    private val terminalView: TerminalView,
+    fontSizePx: Int,
+) {
 
     val isShowing: Boolean get() = terminalView.visibility == View.VISIBLE
 
@@ -124,6 +127,11 @@ class ScrollbackOverlay(private val terminalView: TerminalView) {
     }
 
     init {
+        // setTextSize must run before setTypeface: TerminalView.setTypeface
+        // reads mRenderer.mTextSize, and mRenderer is only created once
+        // setTextSize has run (it tolerates a null mRenderer; setTypeface does
+        // not). show() keeps the size in sync with the live terminal.
+        terminalView.setTextSize(fontSizePx)
         terminalView.setTypeface(Typeface.MONOSPACE)
         terminalView.isFocusable = false
         terminalView.isFocusableInTouchMode = false
