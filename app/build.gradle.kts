@@ -192,7 +192,7 @@ dependencies {
     implementation("org.connectbot:sshlib:2.2.46")
     implementation("androidx.core:core-ktx:1.18.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("com.google.android.material:material:1.13.0")
+    implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
