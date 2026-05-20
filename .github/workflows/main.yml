@@ -38,7 +38,7 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       # See release.yml: WIF subject token chain hits roots not in Temurin's
       # bundled cacerts; install ca-certificates-java so publishReleaseBundle works.
@@ -185,7 +185,7 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - uses: android-actions/setup-android@v4
 

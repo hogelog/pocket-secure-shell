@@ -51,7 +51,7 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       # Temurin's bundled cacerts misses roots that the Workload Identity
       # Federation HTTPS chain hits (subject token from
