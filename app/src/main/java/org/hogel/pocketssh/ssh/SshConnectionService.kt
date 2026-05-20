@@ -429,11 +429,13 @@ class SshConnectionService : Service() {
     }
 
     /**
-     * Capture the tmux pane's full history (`capture-pane -peJ -S -`, with SGR
+     * Capture the tmux pane's recent history (`capture-pane -peJ`, with SGR
      * colours and wrapped lines joined) over a separate SSH session, off the
      * main thread, and deliver the raw bytes on the main thread. Used to render
-     * a native-scrollable scrollback overlay. Failures (not connected, not in
-     * tmux, timeout) report via [onError]; the live session is unaffected.
+     * a native-scrollable scrollback overlay. The start line is capped at
+     * [SCROLLBACK_CAPTURE_LINES] so a large tmux `history-limit` can't feed an
+     * unbounded buffer into the overlay emulator. Failures (not connected, not
+     * in tmux, timeout) report via [onError]; the live session is unaffected.
      */
     fun capturePaneHistory(onResult: (ByteArray) -> Unit, onError: (Throwable) -> Unit) {
         val ssh = session
@@ -443,7 +445,9 @@ class SshConnectionService : Service() {
         }
         Thread({
             try {
-                val bytes = ssh.execCapture("tmux capture-pane -peJ -t pocketssh -S -")
+                val bytes = ssh.execCapture(
+                    "tmux capture-pane -peJ -t pocketssh -S -$SCROLLBACK_CAPTURE_LINES",
+                )
                 mainHandler.post { onResult(bytes) }
             } catch (t: Throwable) {
                 Log.e(TAG, "tmux capture-pane failed", t)
@@ -607,6 +611,10 @@ class SshConnectionService : Service() {
         private const val BACKLOG_REPLAY_CHUNK_BYTES = 16 * 1024
         private const val KEEPALIVE_INTERVAL_SECONDS = 120L
         private const val READ_TRACE_INTERVAL_MS = 10_000L
+        // Cap for `capture-pane -S -<N>`. Matches the overlay emulator's
+        // default transcript depth, so the snapshot fits without dropping rows
+        // and a large tmux history-limit can't blow up memory.
+        private const val SCROLLBACK_CAPTURE_LINES = 2000
         private const val TAG = "SshConnectionService"
     }
 }

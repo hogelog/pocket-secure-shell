@@ -50,7 +50,6 @@
     <string name="notification_text_connected">Connected to %1$s</string>
     <string name="notification_action_disconnect">Disconnect</string>
     <string name="fab_menu">Menu</string>
-    <string name="scrollback_capture_failed">Failed to capture scrollback</string>
     <string name="password_mode_label">🔒</string>
     <string name="password_mode_badge_description">Password input mode (tap to exit)</string>
     <string name="swipe_feedback">%1$s (%2$s)</string>

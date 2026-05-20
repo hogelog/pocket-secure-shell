@@ -1,5 +1,6 @@
 package org.hogel.pocketssh.ui
 
+import android.annotation.SuppressLint
 import android.graphics.Typeface
 import android.util.Log
 import android.view.KeyEvent
@@ -138,6 +139,27 @@ class ScrollbackOverlay(private val terminalView: TerminalView) {
         )
         terminalView.attachSession(session)
         terminalView.setTerminalViewClient(viewClient)
+        wireTouchClose()
+    }
+
+    /**
+     * Drive the overlay's own scroll via [TerminalView.onTouchEvent], then close
+     * it when the user releases at the bottom (`topRow == 0`) — the live stream
+     * never stopped, so the live view is already current. A single tap closes
+     * too, via [viewClient]'s onSingleTapUp.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun wireTouchClose() {
+        terminalView.setOnTouchListener { v, event ->
+            // Drive the native scroll, then always consume so the framework
+            // doesn't re-dispatch to onTouchEvent and nothing leaks past the
+            // overlay to the live view underneath.
+            v.onTouchEvent(event)
+            if (event.actionMasked == MotionEvent.ACTION_UP && terminalView.topRow >= 0) {
+                hide()
+            }
+            true
+        }
     }
 
     companion object {

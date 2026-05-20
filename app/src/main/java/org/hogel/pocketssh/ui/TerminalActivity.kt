@@ -89,6 +89,7 @@ class TerminalActivity : AppCompatActivity() {
     private var bound = false
 
     private lateinit var scrollbackOverlay: ScrollbackOverlay
+    private var scrollbackCapturePending = false
 
     private var pendingParams: SshConnectionService.ConnectionParams? = null
     // Pending tmux window from a deeplink intent. Set in onCreate / onNewIntent,
@@ -476,10 +477,6 @@ class TerminalActivity : AppCompatActivity() {
         applyWindowList(emptyList())
         binding.windowTabsNew.setOnClickListener { openNewTmuxWindow() }
         binding.fabMain.setOnClickListener { setFabExpanded(!fabExpanded) }
-        // TEMPORARY (scrollback overlay M1): long-press the menu FAB to capture
-        // the tmux pane and show the native-scroll overlay. M2 replaces this
-        // with a scroll gesture in setupTerminalScrollRouting.
-        binding.fabMain.setOnLongClickListener { captureAndShowScrollback(); true }
         setFabExpanded(false)
         binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
         // Initial sync so the IME proxy / badge visibility match the
@@ -579,6 +576,9 @@ class TerminalActivity : AppCompatActivity() {
         if (cols == lastSentColumns && rows == lastSentRows) return
         lastSentColumns = cols
         lastSentRows = rows
+        // A resize reflows the remote pane, so the on-screen snapshot is now
+        // stale; drop it and let the next back-scroll re-capture.
+        if (scrollbackOverlay.isShowing) scrollbackOverlay.hide()
         svc.resizeWindow(cols, rows)
     }
 
@@ -1088,6 +1088,13 @@ private fun styleModifierButton(button: Button) {
      * driven by the IME proxy view as well as by Termux's terminal view.
      */
     private fun processHardwareKey(keyCode: Int, event: KeyEvent): Boolean {
+        // While the scrollback overlay is up, Back dismisses it instead of
+        // sending ESC to the remote.
+        if (scrollbackOverlay.isShowing && keyCode == KeyEvent.KEYCODE_BACK) {
+            if (event.action == KeyEvent.ACTION_DOWN) scrollbackOverlay.hide()
+            return true
+        }
+
         val emu = binding.terminalView.mEmulator ?: return false
 
         // Multi-character input (e.g., IME batch)
@@ -1175,6 +1182,7 @@ private fun styleModifierButton(button: Button) {
 
     private fun setupTerminalView() {
         val terminalView = binding.terminalView
+        scrollbackOverlay = ScrollbackOverlay(binding.scrollbackOverlayView)
         fontSizePx = terminalPrefs.getInt(KEY_FONT_SIZE_PX, DEFAULT_FONT_SIZE_PX)
             .coerceIn(MIN_FONT_SIZE_PX, MAX_FONT_SIZE_PX)
         terminalView.setTextSize(fontSizePx)
@@ -1213,17 +1221,39 @@ private fun styleModifierButton(button: Button) {
         terminalView.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
             service?.let { syncWindowSize(it) }
         }
-
-        scrollbackOverlay = ScrollbackOverlay(binding.scrollbackOverlayView)
     }
 
-    private fun captureAndShowScrollback() {
+    /**
+     * True when the live pane's foreground command is a plain shell under tmux.
+     * Under tmux the live emulator is always in the alt-buffer, so
+     * `isAlternateBufferActive` can't tell "tmux shell" from "vim inside tmux";
+     * the OSC-title `pane_current_command` ([lastAppContext]) is what
+     * distinguishes them.
+     */
+    private fun isShellPane(): Boolean {
+        if (!useTmux) return false
+        val command = lastAppContext?.lowercase(Locale.ROOT) ?: return false
+        return command in SHELL_FOREGROUND_COMMANDS
+    }
+
+    /**
+     * Capture the tmux pane history and raise the scrollback overlay. Re-fetched
+     * on every open so the snapshot is never stale; guarded so a single drag
+     * (many onScroll frames) starts only one capture. A failure leaves the
+     * proxy-scroll path untouched — log only, no overlay.
+     */
+    private fun openScrollbackOverlay() {
+        if (scrollbackOverlay.isShowing || scrollbackCapturePending) return
         val svc = service ?: return
-        setFabExpanded(false)
+        scrollbackCapturePending = true
         svc.capturePaneHistory(
-            onResult = { bytes -> scrollbackOverlay.show(bytes, fontSizePx) },
+            onResult = { bytes ->
+                scrollbackCapturePending = false
+                scrollbackOverlay.show(bytes, fontSizePx)
+            },
             onError = {
-                Toast.makeText(this, R.string.scrollback_capture_failed, Toast.LENGTH_SHORT).show()
+                scrollbackCapturePending = false
+                Log.w(TAG, "scrollback capture failed", it)
             },
         )
     }
@@ -1396,6 +1426,16 @@ private fun styleModifierButton(button: Button) {
                 if (deltaWheels == 0) return true
 
                 val up = deltaWheels < 0
+                // Plain-shell scrollback under tmux: a back-scroll here would
+                // otherwise send DPAD_UP and walk the shell's command history,
+                // because the live emulator is in tmux's alt-buffer and has no
+                // transcript of its own. Open the native-scroll overlay over a
+                // capture-pane snapshot instead. Other foreground commands (vim,
+                // less, pagers) keep the existing proxy path below.
+                if (up && isShellPane()) {
+                    openScrollbackOverlay()
+                    return true
+                }
                 val repeats = abs(deltaWheels)
                 when {
                     emu.isMouseTrackingActive -> {
@@ -1816,6 +1856,10 @@ private fun styleModifierButton(button: Button) {
     private enum class GestureAxis { UNDETERMINED, HORIZONTAL, VERTICAL }
 
     companion object {
+        // Foreground commands that own a plain-shell prompt (tmux
+        // pane_current_command), for which a back-scroll opens the scrollback
+        // overlay rather than walking shell history via DPAD_UP.
+        private val SHELL_FOREGROUND_COMMANDS = setOf("bash", "zsh", "fish", "sh")
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
         const val EXTRA_USERNAME = "username"
