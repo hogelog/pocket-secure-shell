@@ -1,3 +1,1 @@
-- Password input mode hides typed passwords from keyboard prediction and in-app suggestions. Auto-engages on common password prompts and is toggleable from the FAB.
-- pss://open?window=<name> deeplink jumps straight to a tmux window, opening the saved SSH connection if needed.
-- Stale SSH connections are now detected on resume; the terminal closes so you can reconnect from the main screen instead of staying frozen.
+- Fixed a hang that could occur when disconnecting from a session.
