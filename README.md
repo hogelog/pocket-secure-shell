@@ -37,7 +37,7 @@ gh attestation verify pocketsecureshell-vX.Y.Z.apk --repo hogelog/pocket-secure-
 
 ### Requirements
 
-- JDK 17
+- JDK 21
 - Android SDK with `compileSdk` 36 (`minSdk` 34, `targetSdk` 36)
 - Android NDK 27.0.12077973
 
