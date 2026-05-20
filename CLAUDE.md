@@ -6,7 +6,7 @@ Android SSH client designed for Claude Code TUI interaction.
 
 - Android SDK with compileSdk 36
 - NDK (for terminal-emulator native code)
-- JDK 17+
+- JDK 21+
 
 ## Project Structure
 
