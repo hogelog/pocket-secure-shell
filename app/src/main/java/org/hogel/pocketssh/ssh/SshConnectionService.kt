@@ -233,7 +233,15 @@ class SshConnectionService : Service() {
             Log.e(TAG, "SSH session error", e)
         } finally {
             stopKeepalive()
-            runCatching { session?.disconnect() }
+            // disconnect() sends an SSH_MSG_DISCONNECT; on a half-open socket
+            // the TCP write can block for the OS keepalive window. Detach it
+            // so state teardown and onSshDisconnected fire immediately —
+            // otherwise the service looks alive (state CONNECTED, session
+            // non-null) while every write fails with "channel is closed".
+            val dying = session
+            Thread({ runCatching { dying?.disconnect() } }, "ssh-shutdown-finally")
+                .apply { isDaemon = true }
+                .start()
             session = null
             lastError = caught
             state = if (caught != null) State.FAILED else State.DISCONNECTED
