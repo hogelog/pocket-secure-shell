@@ -64,14 +64,6 @@ jobs:
           workload_identity_provider: ${{ vars.GCLOUD_WIF_PROVIDER }}
           service_account: ${{ vars.GCLOUD_SERVICE_ACCOUNT }}
 
-      # Drop maven-publish blocks (unused, broken under Gradle 8+) and rewrite
-      # `proguard-android.txt` to the `-optimize` variant required by AGP 9.0.
-      - name: Patch vendor build scripts
-        run: |
-          for f in vendor/termux-app/terminal-emulator/build.gradle vendor/termux-app/terminal-view/build.gradle; do
-            sed -i "/apply plugin: 'maven-publish'/d; /task sourceJar/,/^}/d; /afterEvaluate/,/^}/d; s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
-          done
-
       - name: Read baseVersionName
         id: base-version
         run: |
@@ -192,14 +184,6 @@ jobs:
       - uses: gradle/actions/setup-gradle@v6
         with:
           cache-write-only: true
-
-      # Drop maven-publish blocks (unused, broken under Gradle 8+) and rewrite
-      # `proguard-android.txt` to the `-optimize` variant required by AGP 9.0.
-      - name: Patch vendor build scripts
-        run: |
-          for f in vendor/termux-app/terminal-emulator/build.gradle vendor/termux-app/terminal-view/build.gradle; do
-            sed -i "/apply plugin: 'maven-publish'/d; /task sourceJar/,/^}/d; /afterEvaluate/,/^}/d; s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
-          done
 
       - name: Run lint
         env:
