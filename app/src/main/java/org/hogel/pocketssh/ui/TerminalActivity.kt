@@ -1018,7 +1018,7 @@ class TerminalActivity : AppCompatActivity() {
         return (readTmuxPrefixLetter().code - 'a'.code + 1).toByte()
     }
 
-private fun styleModifierButton(button: Button) {
+    private fun styleModifierButton(button: Button) {
         button.background = ContextCompat.getDrawable(this, R.drawable.bg_aux_modifier)
         ContextCompat.getColorStateList(this, R.color.aux_modifier_text)?.let {
             button.setTextColor(it)
