@@ -137,6 +137,7 @@ class DiagDumpActivity : AppCompatActivity() {
             appendLine("state             = ${snap.state}")
             appendLine("connectionLabel   = ${snap.connectionLabel}")
             appendLine("useTmux           = ${snap.useTmux}")
+            appendLine("tmuxControlMode   = ${snap.useTmuxControlMode}")
             appendLine("lastTitle         = ${snap.lastTitle ?: "(none)"}")
             appendLine("lastError         = ${formatError(snap.lastError)}")
             appendLine("outputBufferBytes = ${snap.outputBufferBytes}")

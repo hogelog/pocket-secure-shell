@@ -16,6 +16,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import org.hogel.pocketssh.BuildConfig
 import org.hogel.pocketssh.R
+import org.hogel.pocketssh.tmux.TmuxControlClient
 import org.hogel.pocketssh.ui.TerminalActivity
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
@@ -93,6 +94,16 @@ class SshConnectionService : Service() {
     var useTmux: Boolean = false
         private set
 
+    // Whether the active session runs tmux in control mode (`tmux -CC`). When
+    // set, [controlClient] parses stdout into pane output and wraps keystrokes
+    // as `send-keys`; the raw byte path is bypassed.
+    @Volatile
+    var useTmuxControlMode: Boolean = false
+        private set
+
+    @Volatile
+    private var controlClient: TmuxControlClient? = null
+
     // Last OSC window title observed by an attached TerminalActivity. Cached
     // here so a freshly created activity can restore its app-context
     // shortcuts even when the title bytes have rolled out of [outputHistory].
@@ -167,8 +178,9 @@ class SshConnectionService : Service() {
             lastError = null
             connectionLabel = "${params.username}@${params.host}:${params.port}"
             useTmux = params.useTmux
+            useTmuxControlMode = params.useTmux && params.tmuxControlMode
             lastTitle = null
-            trace { "state -> CONNECTING (useTmux=${params.useTmux})" }
+            trace { "state -> CONNECTING (useTmux=${params.useTmux} control=$useTmuxControlMode)" }
             updateNotification(getString(R.string.notification_text_connecting))
             readThread = thread(name = "ssh-read") {
                 runReadLoop(params, authenticator, hostKeyPrompt, columns, rows)
@@ -203,8 +215,17 @@ class SshConnectionService : Service() {
                 columns.coerceAtLeast(1),
                 rows.coerceAtLeast(1),
                 params.useTmux,
+                useTmuxControlMode,
             )
             session = ssh
+            controlClient = if (useTmuxControlMode) {
+                TmuxControlClient(
+                    onPaneOutput = ::deliverOutput,
+                    onExit = { reason -> trace { "tmux control %exit ${reason ?: ""}" } },
+                )
+            } else {
+                null
+            }
             state = State.CONNECTED
             lastConnectedAt = System.currentTimeMillis()
             trace { "state -> CONNECTED" }
@@ -214,6 +235,7 @@ class SshConnectionService : Service() {
 
             val buffer = ByteArray(8192)
             val input = ssh.stdout
+            val control = controlClient
             var lastReadTrace = 0L
             while (true) {
                 val n = input.read(buffer)
@@ -225,7 +247,13 @@ class SshConnectionService : Service() {
                     Log.d(TAG, "read total=$totalReadBytes bytes")
                     lastReadTrace = now
                 }
-                deliverOutput(buffer.copyOf(n))
+                // Control mode: the parser unescapes %output and calls
+                // deliverOutput per pane; otherwise raw bytes are the screen.
+                if (control != null) {
+                    control.feed(buffer, n)
+                } else {
+                    deliverOutput(buffer.copyOf(n))
+                }
             }
             trace { "read loop EOF (total=$totalReadBytes)" }
         } catch (e: Throwable) {
@@ -243,6 +271,7 @@ class SshConnectionService : Service() {
                 .apply { isDaemon = true }
                 .start()
             session = null
+            controlClient = null
             lastError = caught
             state = if (caught != null) State.FAILED else State.DISCONNECTED
             trace { "state -> $state" }
@@ -347,9 +376,13 @@ class SshConnectionService : Service() {
 
     fun writeToSsh(data: ByteArray) {
         val out = session?.stdin ?: return
+        // In control mode stdin is the command channel, so input must be wrapped
+        // as `send-keys` rather than written as raw bytes.
+        val bytes = controlClient?.encodeInput(data) ?: data
+        if (bytes.isEmpty()) return
         sshWriteExecutor.execute {
             try {
-                out.write(data)
+                out.write(bytes)
                 out.flush()
             } catch (e: Exception) {
                 Log.e(TAG, "SSH write error", e)
@@ -538,6 +571,7 @@ class SshConnectionService : Service() {
             lastError = lastError,
             connectionLabel = connectionLabel,
             useTmux = useTmux,
+            useTmuxControlMode = useTmuxControlMode,
             lastTitle = lastTitle,
             outputBufferBytes = bufferBytes,
             listenerAttached = attached,
@@ -554,6 +588,7 @@ class SshConnectionService : Service() {
         val lastError: Throwable?,
         val connectionLabel: String,
         val useTmux: Boolean,
+        val useTmuxControlMode: Boolean,
         val lastTitle: String?,
         val outputBufferBytes: Int,
         val listenerAttached: Boolean,
@@ -569,6 +604,7 @@ class SshConnectionService : Service() {
         val port: Int,
         val username: String,
         val useTmux: Boolean = false,
+        val tmuxControlMode: Boolean = false,
     )
 
     private inline fun trace(message: () -> String) {

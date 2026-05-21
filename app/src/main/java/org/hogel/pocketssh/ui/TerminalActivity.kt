@@ -461,6 +461,7 @@ class TerminalActivity : AppCompatActivity() {
             pendingParams = SshConnectionService.ConnectionParams(
                 host, port, username,
                 intent.getBooleanExtra(EXTRA_USE_TMUX, false),
+                intent.getBooleanExtra(EXTRA_TMUX_CONTROL_MODE, false),
             )
         }
         pendingTmuxWindow = intent.getStringExtra(EXTRA_TMUX_WINDOW)
@@ -1801,6 +1802,7 @@ private fun styleModifierButton(button: Button) {
         const val EXTRA_PORT = "port"
         const val EXTRA_USERNAME = "username"
         const val EXTRA_USE_TMUX = "use_tmux"
+        const val EXTRA_TMUX_CONTROL_MODE = "tmux_control_mode"
         // Deeplink (pss://open?window=...) target. When present, switch to
         // the named tmux window once the SSH session is connected.
         const val EXTRA_TMUX_WINDOW = "tmux_window"
