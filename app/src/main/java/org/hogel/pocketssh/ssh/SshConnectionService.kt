@@ -330,8 +330,7 @@ class SshConnectionService : Service() {
      * main thread long enough that taps land after the terminal has
      * already gone unresponsive — and worse, blocking SSH reads back up
      * tmux on the server side, which then can't service new keystrokes
-     * either. The freeze persisted across activity recreation because
-     * each fresh attach re-replayed the (still-growing) buffer.
+     * either.
      */
     fun attachOutputListener(listener: (ByteArray) -> Unit) {
         val backlog: ByteArray?
