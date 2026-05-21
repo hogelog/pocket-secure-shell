@@ -57,6 +57,19 @@ class ScrollbackOverlay(
     }
 
     /**
+     * Scroll by [deltaRows] (negative = back into history, positive = toward
+     * the latest line), clamped to the transcript. Lets the live-view gesture
+     * that opened the overlay keep scrolling it without a second drag; a fresh
+     * drag directly on the overlay uses [TerminalView]'s own momentum scroll.
+     */
+    fun scrollByRows(deltaRows: Int) {
+        val emulator = terminalView.mEmulator ?: return
+        val maxBack = emulator.screen.activeTranscriptRows
+        terminalView.topRow = (terminalView.topRow + deltaRows).coerceIn(-maxBack, 0)
+        terminalView.invalidate()
+    }
+
+    /**
      * tmux `capture-pane` separates lines with bare LF. A terminal emulator
      * treats LF as line-feed only (no carriage return), so without this the
      * snapshot would stairstep diagonally. Operating at the byte level is safe:

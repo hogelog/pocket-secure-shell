@@ -1254,6 +1254,9 @@ private fun styleModifierButton(button: Button) {
             onResult = { bytes ->
                 scrollbackCapturePending = false
                 scrollbackOverlay.show(bytes, fontSizePx)
+                // Drop any sub-step remainder from the pre-open wheel path so
+                // the row-granular forwarding starts clean.
+                scrollRemainderPx = 0f
             },
             onError = {
                 scrollbackCapturePending = false
@@ -1419,6 +1422,23 @@ private fun styleModifierButton(button: Button) {
 
                 val lineHeight = binding.terminalView.height.toFloat() / rows
                 if (lineHeight <= 0f) return false
+
+                // Touch stays with the live view for the whole gesture, so once
+                // the overlay is up the drag that opened it would otherwise do
+                // nothing until the user lifts and drags again. Forward the
+                // delta into the overlay (per row, matching TerminalView's own
+                // scroll granularity) so the opening drag flows straight into
+                // scrolling. A fresh drag directly on the overlay still gets
+                // native momentum via its own touch handling.
+                if (scrollbackOverlay.isShowing) {
+                    handlingScrollGesture = true
+                    val totalRows = distanceY + scrollRemainderPx
+                    val deltaRows = (totalRows / lineHeight).toInt()
+                    scrollRemainderPx = totalRows - deltaRows * lineHeight
+                    if (deltaRows != 0) scrollbackOverlay.scrollByRows(deltaRows)
+                    return true
+                }
+
                 val step = lineHeight * SCROLL_LINES_PER_WHEEL
                 // From this point on we own the gesture even if we end up
                 // emitting zero bytes this frame — otherwise TerminalView would
