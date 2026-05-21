@@ -90,6 +90,9 @@ class TerminalActivity : AppCompatActivity() {
 
     private lateinit var scrollbackOverlay: ScrollbackOverlay
     private var scrollbackCapturePending = false
+    private var scrollbackArmed = false
+    private var scrollbackCaptureBytes: ByteArray? = null
+    private var scrollbackCaptureAt = 0L
 
     private var pendingParams: SshConnectionService.ConnectionParams? = null
     // Pending tmux window from a deeplink intent. Set in onCreate / onNewIntent,
@@ -1241,28 +1244,53 @@ private fun styleModifierButton(button: Button) {
     private fun isScrollbackPane(): Boolean = useTmux && !paneAlternateOn
 
     /**
-     * Capture the tmux pane history and raise the scrollback overlay. Re-fetched
-     * on every open so the snapshot is never stale; guarded so a single drag
-     * (many onScroll frames) starts only one capture. A failure leaves the
-     * proxy-scroll path untouched — log only, no overlay.
+     * Start fetching the pane snapshot without revealing the overlay. Called on
+     * touch-down so the round-trip overlaps the press + drag. Guarded against
+     * overlapping fetches, and a recent snapshot is reused (TTL) so taps don't
+     * re-hit the remote. A failure logs only and leaves the proxy path intact.
      */
-    private fun openScrollbackOverlay() {
-        if (scrollbackOverlay.isShowing || scrollbackCapturePending) return
+    private fun prefetchScrollback() {
+        if (scrollbackCapturePending) return
+        if (scrollbackCaptureBytes != null &&
+            SystemClock.uptimeMillis() - scrollbackCaptureAt < SCROLLBACK_PREFETCH_TTL_MS
+        ) {
+            return
+        }
         val svc = service ?: return
         scrollbackCapturePending = true
         svc.capturePaneHistory(
             onResult = { bytes ->
                 scrollbackCapturePending = false
-                scrollbackOverlay.show(bytes, fontSizePx)
-                // Drop any sub-step remainder from the pre-open wheel path so
-                // the row-granular forwarding starts clean.
-                scrollRemainderPx = 0f
+                scrollbackCaptureBytes = bytes
+                scrollbackCaptureAt = SystemClock.uptimeMillis()
+                if (scrollbackArmed) revealScrollback()
             },
             onError = {
                 scrollbackCapturePending = false
                 Log.w(TAG, "scrollback capture failed", it)
             },
         )
+    }
+
+    /**
+     * Commit to opening the overlay from a back-scroll. Reveals now if the
+     * prefetched snapshot is ready, otherwise as soon as it lands (which may be
+     * mid-drag or just after release). [prefetchScrollback] is re-kicked in
+     * case onDown's fetch was skipped or has expired.
+     */
+    private fun armScrollback() {
+        if (scrollbackOverlay.isShowing) return
+        scrollbackArmed = true
+        if (scrollbackCaptureBytes != null) revealScrollback() else prefetchScrollback()
+    }
+
+    private fun revealScrollback() {
+        val bytes = scrollbackCaptureBytes ?: return
+        scrollbackArmed = false
+        scrollbackOverlay.show(bytes, fontSizePx)
+        // Drop any sub-step remainder so the row-granular forwarding of the
+        // rest of this drag starts clean.
+        scrollRemainderPx = 0f
     }
 
     private fun wireImeProxy() {
@@ -1348,6 +1376,12 @@ private fun styleModifierButton(button: Button) {
                 tappedThisGesture = false
                 gestureAxis = GestureAxis.UNDETERMINED
                 pendingSwipeDirection = 0
+                scrollbackArmed = false
+                // Start fetching the snapshot the moment a finger lands on a
+                // scrollback pane, so the round-trip overlaps the press + drag
+                // and the overlay can open mid-drag rather than after release.
+                // A throttle keeps taps from re-hitting the remote.
+                if (isScrollbackPane()) prefetchScrollback()
                 return false
             }
 
@@ -1423,19 +1457,35 @@ private fun styleModifierButton(button: Button) {
                 val lineHeight = binding.terminalView.height.toFloat() / rows
                 if (lineHeight <= 0f) return false
 
-                // Touch stays with the live view for the whole gesture, so once
-                // the overlay is up the drag that opened it would otherwise do
-                // nothing until the user lifts and drags again. Forward the
-                // delta into the overlay (per row, matching TerminalView's own
-                // scroll granularity) so the opening drag flows straight into
-                // scrolling. A fresh drag directly on the overlay still gets
-                // native momentum via its own touch handling.
-                if (scrollbackOverlay.isShowing) {
+                // Normal-screen tmux pane: the scrollback overlay owns vertical
+                // scroll. The live emulator is in tmux's alt-buffer with no
+                // transcript of its own, so a back-scroll would otherwise just
+                // send DPAD/wheel to the remote. Alternate-screen panes (vim,
+                // less, pagers) fall through to the proxy path below.
+                if (isScrollbackPane()) {
                     handlingScrollGesture = true
-                    val totalRows = distanceY + scrollRemainderPx
-                    val deltaRows = (totalRows / lineHeight).toInt()
-                    scrollRemainderPx = totalRows - deltaRows * lineHeight
-                    if (deltaRows != 0) scrollbackOverlay.scrollByRows(deltaRows)
+                    when {
+                        scrollbackOverlay.isShowing -> {
+                            // Touch stays with the live view for the whole
+                            // gesture, so forward the drag into the overlay (per
+                            // row, matching TerminalView's own scroll
+                            // granularity) — the gesture that opened it keeps
+                            // scrolling instead of waiting for a second drag. A
+                            // fresh drag directly on the overlay still gets
+                            // native momentum via its own touch handling.
+                            val totalRows = distanceY + scrollRemainderPx
+                            val deltaRows = (totalRows / lineHeight).toInt()
+                            scrollRemainderPx = totalRows - deltaRows * lineHeight
+                            if (deltaRows != 0) scrollbackOverlay.scrollByRows(deltaRows)
+                        }
+                        e2.y - e1.y > 0 -> {
+                            // Back drag: commit to opening. Reveals immediately
+                            // if the onDown prefetch is ready, otherwise as soon
+                            // as it lands; either way the rest of this drag is
+                            // forwarded into the overlay.
+                            armScrollback()
+                        }
+                    }
                     return true
                 }
 
@@ -1450,16 +1500,6 @@ private fun styleModifierButton(button: Button) {
                 if (deltaWheels == 0) return true
 
                 val up = deltaWheels < 0
-                // Normal-screen scrollback under tmux: a back-scroll here would
-                // otherwise send DPAD_UP / wheel events to the remote, because
-                // the live emulator is in tmux's alt-buffer and has no
-                // transcript of its own. Open the native-scroll overlay over a
-                // capture-pane snapshot instead. Alternate-screen panes (vim,
-                // less, pagers) keep the existing proxy path below.
-                if (up && isScrollbackPane()) {
-                    openScrollbackOverlay()
-                    return true
-                }
                 val repeats = abs(deltaWheels)
                 when {
                     emu.isMouseTrackingActive -> {
@@ -1936,6 +1976,9 @@ private fun styleModifierButton(button: Button) {
         // default response to a wheel event is three lines, so stepping every
         // two rows works out to a comfortable ~1.5× amplification.
         private const val SCROLL_LINES_PER_WHEEL = 2f
+        // How long a prefetched scrollback snapshot is reused before a fresh
+        // capture, so repeated touches don't re-hit the remote each time.
+        private const val SCROLLBACK_PREFETCH_TTL_MS = 1000L
 
         // Horizontal-swipe thresholds for the tmux window-switch gesture.
         // Distance is the commit threshold: once cumulative |dx| crosses it
