@@ -1,6 +1,7 @@
 package org.hogel.pocketssh.tmux
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -75,9 +76,35 @@ class TmuxTitleTest {
     }
 
     @Test
+    fun `alternate-screen flag parsed from new format`() {
+        val raw = "vim${US}1${US}W:0${GS}vim${GS}1${RS}"
+        val parsed = TmuxTitle.parse(raw)
+        assertEquals("vim", parsed.command)
+        assertTrue(parsed.alternateOn)
+        assertEquals(listOf(TmuxWindow(0, "vim", true)), parsed.windows)
+    }
+
+    @Test
+    fun `normal-screen flag parsed from new format`() {
+        val raw = "bash${US}0${US}W:0${GS}bash${GS}1${RS}"
+        val parsed = TmuxTitle.parse(raw)
+        assertEquals("bash", parsed.command)
+        assertFalse(parsed.alternateOn)
+        assertEquals(listOf(TmuxWindow(0, "bash", true)), parsed.windows)
+    }
+
+    @Test
+    fun `legacy format without flag degrades to normal screen`() {
+        val parsed = TmuxTitle.parse("vim${US}W:0${GS}vim${GS}1${RS}")
+        assertFalse(parsed.alternateOn)
+        assertEquals(listOf(TmuxWindow(0, "vim", true)), parsed.windows)
+    }
+
+    @Test
     fun `format template references expected tmux variables`() {
         val fmt = TmuxTitle.TMUX_TITLE_FORMAT
         assertTrue(fmt.contains("#{pane_current_command}"))
+        assertTrue(fmt.contains("#{?alternate_on,1,0}"))
         assertTrue(fmt.contains("#{W:"))
         assertTrue(fmt.contains("#{window_index}"))
         assertTrue(fmt.contains("#{window_name}"))

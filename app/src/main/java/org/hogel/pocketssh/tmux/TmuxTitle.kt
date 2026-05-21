@@ -9,9 +9,15 @@ package org.hogel.pocketssh.tmux
  * Other OSC codes are silently dropped (only color/clipboard/title cases are
  * handled; everything else hits `unknownParameter`). To surface the window
  * list without forking the vendor emulator, we smuggle it inside the title
- * itself, separated from the foreground command name by control bytes:
+ * itself, separated from the foreground command name and the active pane's
+ * alternate-screen flag by control bytes:
  *
- *   `<pane_current_command>${US}W:<idx>${GS}<name>${GS}<active>${RS}...`
+ *   `<pane_current_command>${US}<alternate_on>${US}W:<idx>${GS}<name>${GS}<active>${RS}...`
+ *
+ * `<alternate_on>` is `1` while the active pane runs a full-screen app on the
+ * alternate screen (vim/less/…), `0` on the normal screen (a shell, or a TUI
+ * that prints into the scrollback). It gates the native scrollback overlay,
+ * which can only reproduce history that lives in tmux's pane buffer.
  *
  * `US`, `RS`, `GS` are the ASCII unit/record/group separators (0x1F, 0x1E,
  * 0x1D) — non-printable and not BEL/ESC, so they pass cleanly through tmux's
@@ -19,6 +25,7 @@ package org.hogel.pocketssh.tmux
  */
 data class TmuxTitle(
     val command: String?,
+    val alternateOn: Boolean,
     val windows: List<TmuxWindow>,
 ) {
     companion object {
@@ -27,24 +34,35 @@ data class TmuxTitle(
         const val GS = ''
         private const val WINDOWS_PREFIX = "W:"
 
-        val EMPTY = TmuxTitle(command = null, windows = emptyList())
+        val EMPTY = TmuxTitle(command = null, alternateOn = false, windows = emptyList())
 
         /**
-         * Parse a raw OSC title. Inputs that don't carry the windows section
-         * (older sessions, non-tmux shells) degrade to `command = title,
-         * windows = []` so existing code that only consumed `command` keeps
-         * working.
+         * Parse a raw OSC title. The alternate-screen flag and windows section
+         * are both optional: a payload that jumps straight to "W:" (or carries
+         * no separators at all) degrades to `alternateOn = false`, so older or
+         * partial inputs keep parsing.
          */
         fun parse(raw: String?): TmuxTitle {
             if (raw.isNullOrEmpty()) return EMPTY
             val sep = raw.indexOf(US)
             if (sep < 0) {
-                return TmuxTitle(command = raw.ifEmpty { null }, windows = emptyList())
+                return TmuxTitle(raw.ifEmpty { null }, alternateOn = false, windows = emptyList())
             }
             val command = raw.substring(0, sep).ifEmpty { null }
-            val rest = raw.substring(sep + 1)
+            var rest = raw.substring(sep + 1)
+            // The alternate-screen flag sits between the command and the
+            // windows section. A payload that goes straight to "W:" carries no
+            // flag (treated as normal screen).
+            var alternateOn = false
             if (!rest.startsWith(WINDOWS_PREFIX)) {
-                return TmuxTitle(command = command, windows = emptyList())
+                val flagSep = rest.indexOf(US)
+                if (flagSep >= 0) {
+                    alternateOn = rest.substring(0, flagSep) == "1"
+                    rest = rest.substring(flagSep + 1)
+                }
+            }
+            if (!rest.startsWith(WINDOWS_PREFIX)) {
+                return TmuxTitle(command, alternateOn, windows = emptyList())
             }
             val windowsBlob = rest.substring(WINDOWS_PREFIX.length)
             val windows = windowsBlob.split(RS)
@@ -57,7 +75,7 @@ data class TmuxTitle(
                     val active = fields[2] == "1"
                     TmuxWindow(index = index, name = name, active = active)
                 }
-            return TmuxTitle(command = command, windows = windows)
+            return TmuxTitle(command, alternateOn, windows)
         }
 
         /**
@@ -69,6 +87,8 @@ data class TmuxTitle(
          */
         val TMUX_TITLE_FORMAT: String = buildString {
             append("#{pane_current_command}")
+            append(US)
+            append("#{?alternate_on,1,0}")
             append(US)
             append(WINDOWS_PREFIX)
             append("#{W:#{window_index}")
