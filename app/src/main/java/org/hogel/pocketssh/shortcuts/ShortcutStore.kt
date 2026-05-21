@@ -11,11 +11,6 @@ import org.json.JSONObject
  * a shortcut bar slice, optional swipe payloads, and an optional FAB row;
  * matching is driven by foreground command name and tmux state. See
  * [ContextGroup] for the schema and [List.resolve] for the cascade rules.
- *
- * The store carries no schema version. Pre-rewrite preference keys (`aux`,
- * `swipe`) are dropped at first read so a running install rolls into the new
- * defaults instead of inheriting half-migrated data — see the PR notes for the
- * rationale.
  */
 class ShortcutStore(context: Context) {
 
@@ -23,10 +18,7 @@ class ShortcutStore(context: Context) {
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     init {
-        // Older versions of the app stored the always-on bar (`aux`) and the
-        // tmux swipe payloads (`swipe`) as standalone preferences. Both have
-        // moved into context groups (`always` and `tmux`), so any leftover
-        // values are stale — purge them on first construction.
+        // Purge stale pre-rewrite keys; their data now lives in context groups.
         if (prefs.contains(LEGACY_KEY_AUX) || prefs.contains(LEGACY_KEY_SWIPE)) {
             prefs.edit {
                 remove(LEGACY_KEY_AUX)
@@ -59,10 +51,9 @@ class ShortcutStore(context: Context) {
         private const val LEGACY_KEY_SWIPE = "swipe"
 
         fun defaultContextGroups(): List<ContextGroup> = listOf(
-            // The "always" group replaces the old standalone aux bar plus the
-            // hardcoded clipboard FAB items. Empty contexts + null useTmux
-            // means it matches every state at specifity 0, so it acts as the
-            // baseline that everything else stacks on top of.
+            // Empty contexts + null useTmux means it matches every state at
+            // specifity 0, so it acts as the baseline that everything else
+            // stacks on top of.
             ContextGroup(
                 name = "always",
                 shortcuts = listOf(
@@ -79,10 +70,8 @@ class ShortcutStore(context: Context) {
                     Shortcut("\uD83D\uDCCB", "{COPY}"),        // 📋 selection mode
                 ),
             ),
-            // The "tmux" group replaces the old hardcoded `useTmux` branch in
-            // setupFabSpeedDial and the global swipe payloads. Swipe direction
-            // mirrors the FAB arrows: ⬅️ / swipe-left = previous window,
-            // ➡️ / swipe-right = next window.
+            // Swipe direction mirrors the FAB arrows: ⬅️ / swipe-left =
+            // previous window, ➡️ / swipe-right = next window.
             ContextGroup(
                 name = "tmux",
                 useTmux = true,
@@ -94,14 +83,10 @@ class ShortcutStore(context: Context) {
                 swipeLeft = Shortcut("⬅️", "{TMUX-PREFIX}p"),
                 swipeRight = Shortcut("➡️", "{TMUX-PREFIX}n"),
             ),
-            // The `claude` deck is intentionally pared down to control-byte
-            // payloads only — ESC, Shift-Tab, ^J. Plain text payloads like
-            // `/clear` and the old `shell` deck (`claude`, `cd `) were
-            // dropped: those are exactly the kind of token the per-context
-            // bigram tracker now surfaces from real usage, so a hardcoded
-            // default would just compete with live counts. Control sequences
-            // can't be observed by the tracker (it poisons the line on the
-            // first byte `< 0x20`), so they have to stay as fixed buttons.
+            // Control-byte payloads only (ESC, Shift-Tab, ^J): the bigram
+            // tracker can't observe control sequences (it poisons the line on
+            // the first byte `< 0x20`), so they have to stay as fixed buttons.
+            // Plain-text tokens are surfaced by the tracker from real usage.
             ContextGroup(
                 name = "claude",
                 contexts = listOf("claude"),
