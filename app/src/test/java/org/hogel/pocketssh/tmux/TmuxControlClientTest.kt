@@ -9,11 +9,18 @@ import org.junit.Test
 class TmuxControlClientTest {
 
     private val output = mutableListOf<ByteArray>()
+    private val captures = mutableListOf<Pair<String, ByteArray>>()
+    private val windowsUpdates = mutableListOf<List<TmuxControlWindow>>()
     private val exits = mutableListOf<String?>()
     private val client = TmuxControlClient(
-        onPaneOutput = { output += it },
+        onPaneOutput = { _, bytes -> output += bytes },
+        onCaptureReply = { pane, body -> captures += pane to body },
+        onWindowsChanged = { windowsUpdates += it },
+        onWindowsDirty = { windowsDirtyCount++ },
         onExit = { exits += it },
     )
+
+    private var windowsDirtyCount = 0
 
     private fun feed(s: String) = client.feed(s.toByteArray(Charsets.ISO_8859_1))
 
@@ -115,10 +122,17 @@ class TmuxControlClientTest {
     }
 
     @Test
-    fun `encodeInput targets the active pane`() {
-        feed("%output %3 \n") // sets active pane to %3
+    fun `encodeInput targets the pane set via setInputPane`() {
+        client.setInputPane("%3")
         val cmd = String(client.encodeInput(byteArrayOf(0x1B, 0x5B, 0x41)), Charsets.US_ASCII)
         assertEquals("send-keys -t %3 -lH 1b 5b 41\n", cmd)
+    }
+
+    @Test
+    fun `encodeInput does not follow the last output pane`() {
+        feed("%output %7 hi\n") // background pane emits; must not become the target
+        val cmd = String(client.encodeInput("a".toByteArray()), Charsets.US_ASCII)
+        assertEquals("send-keys -lH 61\n", cmd) // no -t, since no pane was set
     }
 
     @Test
@@ -138,5 +152,73 @@ class TmuxControlClientTest {
         val data = ByteArray(600) { 'a'.code.toByte() }
         val cmd = String(client.encodeInput(data), Charsets.US_ASCII)
         assertEquals(2, cmd.trim().lines().size)
+    }
+
+    // --- capture-pane reply body ---
+
+    @Test
+    fun `requestCapture targets the pane and reaches into history`() {
+        val cmd = String(client.requestCapture("%2"), Charsets.US_ASCII)
+        assertEquals("capture-pane -peJ -t %2 -S -2000\n", cmd)
+    }
+
+    @Test
+    fun `capture reply body routes to the requesting pane joined by CRLF`() {
+        client.requestCapture("%2")
+        feed("%begin 1 5 0\n")
+        feed("line one\n")
+        feed("line two\n")
+        feed("%end 1 5 0\n")
+        assertEquals("%2", captures.single().first)
+        assertArrayEquals("line one\r\nline two".toByteArray(), captures.single().second)
+    }
+
+    @Test
+    fun `a body line that looks like a terminator does not close on a mismatched number`() {
+        client.requestCapture("%0")
+        feed("%begin 1 7 0\n")
+        feed("%end 1 99 0\n") // captured content, not the terminator (number != 7)
+        feed("real\n")
+        feed("%end 1 7 0\n")
+        assertArrayEquals("%end 1 99 0\r\nreal".toByteArray(), captures.single().second)
+    }
+
+    @Test
+    fun `out-of-band begin block with no pending command is ignored`() {
+        feed("%begin 1 1 0\n")
+        feed("@1 state\n")
+        feed("%end 1 1 0\n")
+        assertTrue(captures.isEmpty())
+    }
+
+    @Test
+    fun `replies are consumed in send order before the capture reply`() {
+        client.encodeInput("ab".toByteArray()) // enqueues one send-keys command
+        client.requestCapture("%1")
+        feed("%begin 1 1 0\n%end 1 1 0\n") // send-keys reply: body dropped
+        feed("%begin 1 2 0\nhi\n%end 1 2 0\n") // capture reply
+        assertEquals("%1", captures.single().first)
+        assertArrayEquals("hi".toByteArray(), captures.single().second)
+    }
+
+    // --- list-windows reply ---
+
+    @Test
+    fun `list-windows reply is parsed into windows`() {
+        client.requestWindows()
+        feed("%begin 1 9 0\n")
+        feed("@0\t0\tbash\t0\t%0\tbash\n")
+        feed("@13\t4\tclaude\t1\t%19\tnode\n")
+        feed("%end 1 9 0\n")
+        val windows = windowsUpdates.single()
+        assertEquals(2, windows.size)
+        assertEquals(TmuxControlWindow("@13", 4, "claude", true, "%19", "node"), windows[1])
+    }
+
+    @Test
+    fun `requestWindows emits a tab-delimited list-windows format`() {
+        val cmd = String(client.requestWindows(), Charsets.US_ASCII)
+        assertTrue(cmd.startsWith("list-windows -F "))
+        assertTrue(cmd.contains("#{window_id}\t#{window_index}"))
     }
 }

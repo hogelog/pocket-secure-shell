@@ -17,6 +17,7 @@ import androidx.core.app.ServiceCompat
 import org.hogel.pocketssh.BuildConfig
 import org.hogel.pocketssh.R
 import org.hogel.pocketssh.tmux.TmuxControlClient
+import org.hogel.pocketssh.tmux.TmuxControlWindow
 import org.hogel.pocketssh.ui.TerminalActivity
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
@@ -41,6 +42,15 @@ class SshConnectionService : Service() {
     interface StatusListener {
         fun onSshConnected() {}
         fun onSshDisconnected(error: Throwable?) {}
+    }
+
+    /** Receives control-mode events routed per pane. Attached only while a
+     *  control-mode terminal UI is bound; raw mode keeps using
+     *  [attachOutputListener]. */
+    interface TmuxControlListener {
+        fun onPaneOutput(paneId: String, bytes: ByteArray)
+        fun onCaptureReply(paneId: String, body: ByteArray)
+        fun onWindowsChanged(windows: List<TmuxControlWindow>)
     }
 
     inner class LocalBinder : Binder() {
@@ -103,6 +113,11 @@ class SshConnectionService : Service() {
 
     @Volatile
     private var controlClient: TmuxControlClient? = null
+    private var controlListener: TmuxControlListener? = null
+
+    @Volatile private var paneOutputCount = 0
+    @Volatile private var capturesSent = 0
+    @Volatile private var captureRepliesReceived = 0
 
     // Last OSC window title observed by an attached TerminalActivity. Cached
     // here so a freshly created activity can restore its app-context
@@ -179,6 +194,9 @@ class SshConnectionService : Service() {
             connectionLabel = "${params.username}@${params.host}:${params.port}"
             useTmux = params.useTmux
             useTmuxControlMode = params.useTmux && params.tmuxControlMode
+            paneOutputCount = 0
+            capturesSent = 0
+            captureRepliesReceived = 0
             lastTitle = null
             trace { "state -> CONNECTING (useTmux=${params.useTmux} control=$useTmuxControlMode)" }
             updateNotification(getString(R.string.notification_text_connecting))
@@ -220,7 +238,18 @@ class SshConnectionService : Service() {
             session = ssh
             controlClient = if (useTmuxControlMode) {
                 TmuxControlClient(
-                    onPaneOutput = ::deliverOutput,
+                    onPaneOutput = { pane, bytes ->
+                        paneOutputCount++
+                        mainHandler.post { controlListener?.onPaneOutput(pane, bytes) }
+                    },
+                    onCaptureReply = { pane, body ->
+                        captureRepliesReceived++
+                        mainHandler.post { controlListener?.onCaptureReply(pane, body) }
+                    },
+                    onWindowsChanged = { windows ->
+                        mainHandler.post { controlListener?.onWindowsChanged(windows) }
+                    },
+                    onWindowsDirty = { sendWindowList() },
                     onExit = { reason -> trace { "tmux control %exit ${reason ?: ""}" } },
                 )
             } else {
@@ -236,6 +265,9 @@ class SshConnectionService : Service() {
             val buffer = ByteArray(8192)
             val input = ssh.stdout
             val control = controlClient
+            // The window list is requested on %session-changed (see the control
+            // client), not here, so a spontaneous attach-time %begin can't steal
+            // the list-windows reply via the command FIFO.
             var lastReadTrace = 0L
             while (true) {
                 val n = input.read(buffer)
@@ -353,6 +385,89 @@ class SshConnectionService : Service() {
     fun detachOutputListener() {
         synchronized(outputLock) { outputListener = null }
         trace { "detachOutputListener" }
+    }
+
+    fun attachControlListener(listener: TmuxControlListener) {
+        controlListener = listener
+    }
+
+    fun detachControlListener() {
+        controlListener = null
+    }
+
+    /** Issue a `capture-pane` for [paneId] on the control command channel; its
+     *  reply body is routed to [TmuxControlListener.onCaptureReply]. */
+    fun requestPaneCapture(paneId: String) {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.requestCapture(paneId) ?: return
+        capturesSent++
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "capture request error", e)
+            }
+        }
+    }
+
+    /** Ask tmux for the window/pane list. tmux does not push it on attach, so
+     *  this fires on %session-changed (cold attach) and on UI re-attach. */
+    fun requestWindowList() = sendWindowList()
+
+    private val windowListRequest = Runnable { sendWindowListNow() }
+
+    /** Coalesce a burst of window notifications into a single list-windows. */
+    private fun sendWindowList() {
+        mainHandler.removeCallbacks(windowListRequest)
+        mainHandler.postDelayed(windowListRequest, WINDOW_LIST_DEBOUNCE_MS)
+    }
+
+    private fun sendWindowListNow() {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.requestWindows() ?: return
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "list-windows request error", e)
+            }
+        }
+    }
+
+    /** Switch the active tmux window (control mode); the resulting
+     *  `%session-window-changed` re-requests the window list. */
+    fun selectWindow(windowId: String) {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.selectWindow(windowId) ?: return
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "select-window error", e)
+            }
+        }
+    }
+
+    /** Create a new tmux window (control mode; prefix keys don't work). */
+    fun newWindow() {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.newWindow() ?: return
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "new-window error", e)
+            }
+        }
+    }
+
+    /** Point keystrokes at the pane the user is viewing. */
+    fun setInputPane(paneId: String) {
+        controlClient?.setInputPane(paneId)
     }
 
     fun addStatusListener(listener: StatusListener) {
@@ -579,6 +694,9 @@ class SshConnectionService : Service() {
             lastReadAt = lastReadAt,
             totalReadBytes = totalReadBytes,
             lastKeepaliveAt = lastKeepaliveAt,
+            paneOutputCount = paneOutputCount,
+            capturesSent = capturesSent,
+            captureRepliesReceived = captureRepliesReceived,
         )
     }
 
@@ -596,6 +714,9 @@ class SshConnectionService : Service() {
         val lastReadAt: Long,
         val totalReadBytes: Long,
         val lastKeepaliveAt: Long,
+        val paneOutputCount: Int,
+        val capturesSent: Int,
+        val captureRepliesReceived: Int,
     )
 
     data class ConnectionParams(
@@ -618,6 +739,7 @@ class SshConnectionService : Service() {
         private const val BACKLOG_REPLAY_CHUNK_BYTES = 16 * 1024
         private const val KEEPALIVE_INTERVAL_SECONDS = 120L
         private const val READ_TRACE_INTERVAL_MS = 10_000L
+        private const val WINDOW_LIST_DEBOUNCE_MS = 80L
         private const val TAG = "SshConnectionService"
     }
 }

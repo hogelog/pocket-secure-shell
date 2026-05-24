@@ -147,6 +147,9 @@ class DiagDumpActivity : AppCompatActivity() {
             appendLine("lastReadAt        = ${formatAge(snap.lastReadAt, now)}")
             appendLine("totalReadBytes    = ${snap.totalReadBytes}")
             appendLine("lastKeepaliveAt   = ${formatAge(snap.lastKeepaliveAt, now)}")
+            appendLine("paneOutputCount   = ${snap.paneOutputCount}")
+            appendLine("capturesSent      = ${snap.capturesSent}")
+            appendLine("captureReplies    = ${snap.captureRepliesReceived}")
         }
         appendLine()
 

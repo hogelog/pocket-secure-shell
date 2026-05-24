@@ -63,6 +63,7 @@ import org.hogel.pocketssh.ssh.BiometricAuthenticator
 import org.hogel.pocketssh.ssh.HostKeyPrompt
 import org.hogel.pocketssh.ssh.SshConnectionService
 import org.hogel.pocketssh.ssh.SshKeyManager
+import org.hogel.pocketssh.tmux.TmuxControlWindow
 import org.hogel.pocketssh.tmux.TmuxTitle
 import org.hogel.pocketssh.tmux.TmuxWindow
 import com.termux.terminal.KeyHandler
@@ -323,6 +324,28 @@ class TerminalActivity : AppCompatActivity() {
 
     private val outputListener: (ByteArray) -> Unit = ::handleSshOutput
 
+    private var paneManager: PaneManager? = null
+
+    private val controlListener = object : SshConnectionService.TmuxControlListener {
+        override fun onPaneOutput(paneId: String, bytes: ByteArray) {
+            paneManager?.onOutput(paneId, bytes)
+            detectPasswordPrompt(bytes)
+        }
+
+        override fun onCaptureReply(paneId: String, body: ByteArray) {
+            paneManager?.onCaptureReply(paneId, body)
+        }
+
+        override fun onWindowsChanged(windows: List<TmuxControlWindow>) {
+            paneManager?.setWindows(windows)
+            applyControlWindows(windows)
+            // Drive the per-app shortcut bar from the active window's foreground
+            // command (control mode has no OSC title to carry it).
+            val command = windows.firstOrNull { it.active }?.command
+            if (!command.isNullOrEmpty() && command != lastAppContext) applyContext(command)
+        }
+    }
+
     private fun handleSshOutput(data: ByteArray) {
         val emulator = binding.terminalView.mEmulator ?: return
         emulator.append(data, data.size)
@@ -404,7 +427,6 @@ class TerminalActivity : AppCompatActivity() {
             val svc = (ibinder as SshConnectionService.LocalBinder).getService()
             service = svc
             bound = true
-            svc.attachOutputListener(outputListener)
             svc.addStatusListener(statusListener)
             val params = pendingParams
             when {
@@ -428,6 +450,20 @@ class TerminalActivity : AppCompatActivity() {
             // per-app shortcut row survives even when the title OSC has rolled
             // out of the buffer.
             useTmux = svc.useTmux
+            if (svc.useTmuxControlMode) {
+                paneManager = PaneManager(
+                    binding.terminalView,
+                    sessionClient,
+                    { svc.requestPaneCapture(it) },
+                    { svc.setInputPane(it) },
+                )
+                svc.attachControlListener(controlListener)
+                // Cold attach gets the window list via %session-changed; a
+                // re-attach to an already-connected service must ask again.
+                if (svc.state == SshConnectionService.State.CONNECTED) svc.requestWindowList()
+            } else {
+                svc.attachOutputListener(outputListener)
+            }
             applyTitle(svc.lastTitle)
             // Already-connected branch: a deeplink fired while the SSH session
             // was alive needs to switch windows now (no onSshConnected callback
@@ -653,6 +689,43 @@ class TerminalActivity : AppCompatActivity() {
             tab.isActivated = window.active
             container.addView(tab, auxButtonLayoutParams())
         }
+    }
+
+    private var lastControlWindows: List<TmuxControlWindow> = emptyList()
+
+    /** Control-mode tab strip: same look as [applyWindowList] but driven by the
+     *  control-channel window list, with tabs that select by window id. */
+    private fun applyControlWindows(windows: List<TmuxControlWindow>) {
+        if (windows == lastControlWindows) return
+        lastControlWindows = windows
+        val container = binding.windowTabs
+        container.removeAllViews()
+        binding.windowTabsBar.visibility = if (windows.isNotEmpty()) View.VISIBLE else View.GONE
+        if (windows.isEmpty()) return
+        val tabHorizontalPaddingPx = dpToPx(6)
+        val tabMinDimensionPx = dpToPx(32)
+        for (window in windows) {
+            val label = getString(R.string.window_tab_label, window.index, window.name)
+            val tab = makeAuxButton(label) { service?.selectWindow(window.id) }
+            tab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            tab.setPadding(tabHorizontalPaddingPx, 0, tabHorizontalPaddingPx, 0)
+            tab.minWidth = tabMinDimensionPx
+            tab.minimumWidth = tabMinDimensionPx
+            tab.minHeight = tabMinDimensionPx
+            tab.minimumHeight = tabMinDimensionPx
+            styleModifierButton(tab)
+            tab.isActivated = window.active
+            container.addView(tab, auxButtonLayoutParams())
+        }
+        val newTab = makeAuxButton("+") { service?.newWindow() }
+        newTab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        newTab.setPadding(tabHorizontalPaddingPx, 0, tabHorizontalPaddingPx, 0)
+        newTab.minWidth = tabMinDimensionPx
+        newTab.minimumWidth = tabMinDimensionPx
+        newTab.minHeight = tabMinDimensionPx
+        newTab.minimumHeight = tabMinDimensionPx
+        styleModifierButton(newTab)
+        container.addView(newTab, auxButtonLayoutParams())
     }
 
     /**
@@ -1664,12 +1737,14 @@ class TerminalActivity : AppCompatActivity() {
         pendingTitleHandler.removeCallbacks(pendingTitleRunnable)
         if (bound) {
             service?.detachOutputListener()
+            service?.detachControlListener()
             service?.removeStatusListener(statusListener)
             unbindService(serviceConnection)
             bound = false
             service = null
         }
         biometricExecutor.shutdownNow()
+        paneManager?.finishAll()
         binding.terminalView.mTermSession?.finishIfRunning()
         super.onDestroy()
     }
