@@ -38,15 +38,34 @@ val versionForCode: String? = when {
     else -> null
 }
 
+// COMMITS_SINCE_TAG counts commits on main only. PR builds count up to the merge-base with the PR
+// base (BASE_SHA) instead of HEAD, so the PR's own commits never bump versionCode; otherwise builds
+// across PRs get different codes and fail to install over each other as a downgrade. Release/main
+// builds build a commit already on main, so they count HEAD. Outside CI (no BASE_SHA) PR builds
+// fall back to HEAD, where versionCode is irrelevant (no installable artifact is published).
+val countTip: String = if (prNumber != null) {
+    val baseSha = System.getenv("BASE_SHA")?.takeIf { it.isNotBlank() }
+    if (baseSha != null) {
+        providers.exec {
+            commandLine("git", "merge-base", "HEAD", baseSha)
+            isIgnoreExitValue = true
+        }.standardOutput.asText.map { it.trim() }.getOrElse("").ifEmpty { "HEAD" }
+    } else {
+        "HEAD"
+    }
+} else {
+    "HEAD"
+}
+
 val commitsSinceTag: Int = if (versionForCode != null) {
     val prevTag = providers.exec {
-        commandLine("git", "describe", "--tags", "--abbrev=0", "--match=v*", "--exclude=v$versionForCode", "HEAD")
+        commandLine("git", "describe", "--tags", "--abbrev=0", "--match=v*", "--exclude=v$versionForCode", countTip)
         isIgnoreExitValue = true
     }.standardOutput.asText.map { it.trim() }.getOrElse("")
     val countCmd = if (prevTag.isNotEmpty()) {
-        listOf("git", "rev-list", "--count", "$prevTag..HEAD")
+        listOf("git", "rev-list", "--count", "$prevTag..$countTip")
     } else {
-        listOf("git", "rev-list", "--count", "HEAD")
+        listOf("git", "rev-list", "--count", countTip)
     }
     providers.exec {
         commandLine(countCmd)
