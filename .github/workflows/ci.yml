@@ -2,9 +2,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   build:
-    if: contains(fromJSON(vars.CI_ALLOWED_USERS), github.event.pull_request.user.login)
     runs-on: ubuntu-latest
 
     steps:
@@ -36,7 +39,7 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - uses: android-actions/setup-android@v4
 
@@ -44,19 +47,91 @@ jobs:
         with:
           cache-read-only: true
 
-      # Drop maven-publish blocks (unused, broken under Gradle 8+) and rewrite
-      # `proguard-android.txt` to the `-optimize` variant required by AGP 9.0.
-      - name: Patch vendor build scripts
-        run: |
-          for f in vendor/termux-app/terminal-emulator/build.gradle vendor/termux-app/terminal-view/build.gradle; do
-            sed -i "/apply plugin: 'maven-publish'/d; /task sourceJar/,/^}/d; /afterEvaluate/,/^}/d; s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
-          done
-
       - name: Build debug APK
         env:
           SENTRY_DSN: ${{ vars.SENTRY_DSN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: ./gradlew assembleDebug --configuration-cache
+
+      - name: Publish CI prerelease for PR
+        id: ci_prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          SHORT_SHA="${HEAD_SHA:0:7}"
+          TAG="ci-pr-${PR_NUMBER}"
+          APK_NAME="pocketsecureshell-pr-${PR_NUMBER}-${SHORT_SHA}-debug.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$APK_NAME"
+          # Replace any existing release for this PR so only one prerelease
+          # exists per PR at any time.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Deleting previous release ${TAG}"
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            --title "CI build for PR #${PR_NUMBER} (${SHORT_SHA})" \
+            --notes "Automatic CI build of ${HEAD_SHA} for PR #${PR_NUMBER}" \
+            --prerelease \
+            --target "${HEAD_SHA}" \
+            "$APK_NAME"
+          {
+            echo "tag=${TAG}"
+            echo "apk_name=${APK_NAME}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment release info on PR
+        if: steps.ci_prerelease.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          TAG: ${{ steps.ci_prerelease.outputs.tag }}
+          APK_NAME: ${{ steps.ci_prerelease.outputs.apk_name }}
+        run: |
+          RELEASE_URL="${SERVER_URL}/${REPO}/releases/tag/${TAG}"
+          APK_URL="${SERVER_URL}/${REPO}/releases/download/${TAG}/${APK_NAME}"
+          MARKER="<!-- pocketsecureshell-ci-build -->"
+
+          # Hide previous CI build comments on this PR
+          gh api graphql \
+            -F owner="$REPO_OWNER" -F name="$REPO_NAME" -F number="$PR_NUMBER" \
+            -f query='
+              query($owner:String!, $name:String!, $number:Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $number) {
+                    comments(first: 100) {
+                      nodes { id body isMinimized }
+                    }
+                  }
+                }
+              }' \
+            --jq ".data.repository.pullRequest.comments.nodes[]
+                  | select((.isMinimized | not) and (.body | startswith(\"${MARKER}\")))
+                  | .id" \
+            | while read -r node_id; do
+                [ -z "$node_id" ] && continue
+                echo "Hiding previous CI comment: $node_id"
+                gh api graphql -F id="$node_id" -f query='
+                  mutation($id:ID!) {
+                    minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) {
+                      minimizedComment { isMinimized }
+                    }
+                  }'
+              done
+
+          gh pr comment "$PR_NUMBER" --body "${MARKER}
+          CI build for \`${HEAD_SHA}\` is ready.
+
+          - Release: ${RELEASE_URL}
+          - APK: [\`${APK_NAME}\`](${APK_URL})
+          - Revision: \`${HEAD_SHA}\`"
 
       - name: Upload to DeployGate
         env:
@@ -73,7 +148,6 @@ jobs:
             "https://deploygate.com/api/users/${DEPLOYGATE_USER_NAME}/apps"
 
   lint:
-    if: contains(fromJSON(vars.CI_ALLOWED_USERS), github.event.pull_request.user.login)
     runs-on: ubuntu-latest
 
     steps:
@@ -103,21 +177,13 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - uses: android-actions/setup-android@v4
 
       - uses: gradle/actions/setup-gradle@v6
         with:
           cache-read-only: true
-
-      # Drop maven-publish blocks (unused, broken under Gradle 8+) and rewrite
-      # `proguard-android.txt` to the `-optimize` variant required by AGP 9.0.
-      - name: Patch vendor build scripts
-        run: |
-          for f in vendor/termux-app/terminal-emulator/build.gradle vendor/termux-app/terminal-view/build.gradle; do
-            sed -i "/apply plugin: 'maven-publish'/d; /task sourceJar/,/^}/d; /afterEvaluate/,/^}/d; s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
-          done
 
       - name: Run lint
         env:
@@ -126,7 +192,6 @@ jobs:
         run: ./gradlew :app:lintDebug --configuration-cache
 
   test:
-    if: contains(fromJSON(vars.CI_ALLOWED_USERS), github.event.pull_request.user.login)
     runs-on: ubuntu-latest
 
     steps:
@@ -156,21 +221,13 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - uses: android-actions/setup-android@v4
 
       - uses: gradle/actions/setup-gradle@v6
         with:
           cache-read-only: true
-
-      # Drop maven-publish blocks (unused, broken under Gradle 8+) and rewrite
-      # `proguard-android.txt` to the `-optimize` variant required by AGP 9.0.
-      - name: Patch vendor build scripts
-        run: |
-          for f in vendor/termux-app/terminal-emulator/build.gradle vendor/termux-app/terminal-view/build.gradle; do
-            sed -i "/apply plugin: 'maven-publish'/d; /task sourceJar/,/^}/d; /afterEvaluate/,/^}/d; s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
-          done
 
       - name: Run unit tests
         env:

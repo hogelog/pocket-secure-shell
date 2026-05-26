@@ -89,6 +89,16 @@ class TerminalActivity : AppCompatActivity() {
     private var bound = false
 
     private var pendingParams: SshConnectionService.ConnectionParams? = null
+    // Pending tmux window from a deeplink intent. Set in onCreate / onNewIntent,
+    // cleared after execTmuxSelectWindow fires (whether cold-start once SSH
+    // connects, or warm-start immediately on onNewIntent).
+    private var pendingTmuxWindow: String? = null
+
+    @Volatile
+    private var probeInFlight: Boolean = false
+
+    @Volatile
+    private var staleConnectionHandled: Boolean = false
 
     // BiometricPrompt callbacks run on this executor; we keep the UI thread
     // free and post prompt-show calls explicitly via runOnUiThread below.
@@ -199,6 +209,19 @@ class TerminalActivity : AppCompatActivity() {
     // actions are gone-by-default and animated in/out.
     private var fabExpanded = false
 
+    // Secure-input mode: when active, the IME proxy advertises a password
+    // editor (so the keyboard suppresses prediction/learning) and bytes sent
+    // to ssh are kept out of the bigram tracker. Auto-flips off on the first
+    // CR/LF in `writeToSsh`, or the user can tap the on-screen badge.
+    private var secureInputActive = false
+
+    // Rolling tail of recent SSH output, scanned by `handleSshOutput` to
+    // detect password prompts (`Password:`, `[sudo] password for ...:`) and
+    // flip [secureInputActive] on silently. Bounded to a few hundred bytes —
+    // any password prompt fits comfortably and a sliding window stops the
+    // buffer from growing without bound across the session.
+    private val recentOutputTail = java.io.ByteArrayOutputStream()
+
     // Active image-upload progress dialog, or null when no upload is in
     // flight. Held so onDestroy can dismiss it to avoid a window leak when
     // the activity tears down mid-upload.
@@ -304,14 +327,68 @@ class TerminalActivity : AppCompatActivity() {
         val emulator = binding.terminalView.mEmulator ?: return
         emulator.append(data, data.size)
         binding.terminalView.invalidate()
+        detectPasswordPrompt(data)
+    }
+
+    /**
+     * Append [data] to [recentOutputTail] (kept bounded to the last
+     * [OUTPUT_TAIL_KEEP_BYTES] bytes) and silently flip secure-input mode on
+     * when the tail ends with a password-prompt pattern. No-op once secure
+     * input is already active so a multi-chunk prompt doesn't fire repeatedly.
+     */
+    private fun detectPasswordPrompt(data: ByteArray) {
+        if (data.isEmpty()) return
+        recentOutputTail.write(data)
+        if (recentOutputTail.size() > OUTPUT_TAIL_KEEP_BYTES) {
+            val all = recentOutputTail.toByteArray()
+            val keep = all.copyOfRange(all.size - OUTPUT_TAIL_KEEP_BYTES, all.size)
+            recentOutputTail.reset()
+            recentOutputTail.write(keep)
+        }
+        if (secureInputActive) return
+        // ASCII decode is enough — every password prompt token we care about
+        // (`Password`, `password`, `for`, `[sudo]`) is plain ASCII, and stray
+        // non-ASCII bytes upstream just become replacement characters that
+        // can't accidentally match the regex.
+        val ascii = String(recentOutputTail.toByteArray(), Charsets.US_ASCII)
+        // Strip CSI escape sequences (`ESC [ ... <final>`) and bare ESCs that
+        // typically wrap prompt drawing so the trailing match below sees the
+        // visible text only.
+        val stripped = ANSI_ESCAPE_REGEX.replace(ascii, "").replace("\u001B", "")
+        val trimmed = stripped.trimEnd()
+        if (PASSWORD_PROMPT_REGEX.containsMatchIn(trimmed)) {
+            setSecureInput(true)
+        }
+    }
+
+    /**
+     * Centralised toggle for [secureInputActive]. Keeps the IME proxy, the
+     * on-screen badge, and the bigram tracker's line state in sync so neither
+     * the view layer nor the suggestion row holds stale state when secure
+     * mode flips on or off.
+     */
+    private fun setSecureInput(active: Boolean) {
+        if (secureInputActive == active) return
+        secureInputActive = active
+        binding.imeProxy.secureMode = active
+        binding.btnPasswordBadge.visibility = if (active) View.VISIBLE else View.GONE
+        if (!active) {
+            // Bytes typed during secure mode were skipped by ingestSend, so
+            // the tracker's `prev` may point at a stale token from before the
+            // password. Reset to <BOL> so the next line's suggestions start
+            // from a known state.
+            bigramTracker.resetLine()
+        }
     }
 
     private val statusListener = object : SshConnectionService.StatusListener {
         override fun onSshConnected() {
             service?.let { syncWindowSize(it) }
+            flushPendingTmuxWindow()
         }
 
         override fun onSshDisconnected(error: Throwable?) {
+            if (staleConnectionHandled) return
             val message = if (error != null) {
                 "${getString(R.string.connection_failed)}: ${error.message}"
             } else {
@@ -352,6 +429,12 @@ class TerminalActivity : AppCompatActivity() {
             // out of the buffer.
             useTmux = svc.useTmux
             applyTitle(svc.lastTitle)
+            // Already-connected branch: a deeplink fired while the SSH session
+            // was alive needs to switch windows now (no onSshConnected callback
+            // will come). Cold-start instead waits for statusListener.
+            if (svc.state == SshConnectionService.State.CONNECTED) {
+                flushPendingTmuxWindow()
+            }
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
@@ -380,6 +463,7 @@ class TerminalActivity : AppCompatActivity() {
                 intent.getBooleanExtra(EXTRA_USE_TMUX, false),
             )
         }
+        pendingTmuxWindow = intent.getStringExtra(EXTRA_TMUX_WINDOW)
 
         setupTerminalView()
         setupTerminalScrollRouting()
@@ -391,6 +475,11 @@ class TerminalActivity : AppCompatActivity() {
         binding.windowTabsNew.setOnClickListener { openNewTmuxWindow() }
         binding.fabMain.setOnClickListener { setFabExpanded(!fabExpanded) }
         setFabExpanded(false)
+        binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
+        // Initial sync so the IME proxy / badge visibility match the
+        // default-off state on a freshly created activity.
+        binding.btnPasswordBadge.visibility = View.GONE
+        binding.imeProxy.secureMode = false
 
         binding.btnDisconnect.setOnClickListener {
             service?.shutdown()
@@ -412,6 +501,62 @@ class TerminalActivity : AppCompatActivity() {
         // the cascade on every resume so edits take effect the moment we come
         // back, without waiting for tmux to re-emit the title OSC.
         applyContext(lastAppContext)
+        maybeProbeLiveness()
+    }
+
+    override fun onNewIntent(newIntent: Intent) {
+        super.onNewIntent(newIntent)
+        // Warm-start path for the pss://open?window=... deeplink. The activity
+        // is launchMode=singleTop, so MainActivity re-issues us with the new
+        // window target instead of starting a fresh instance.
+        setIntent(newIntent)
+        newIntent.getStringExtra(EXTRA_TMUX_WINDOW)?.let { window ->
+            pendingTmuxWindow = window
+            flushPendingTmuxWindow()
+        }
+    }
+
+    /**
+     * Fire the deferred `tmux select-window` for [pendingTmuxWindow], if any.
+     * Safe to call multiple times: clears the field on consumption so a later
+     * onSshConnected does not re-fire. Toasts on failure.
+     */
+    private fun flushPendingTmuxWindow() {
+        val window = pendingTmuxWindow ?: return
+        val svc = service ?: return
+        if (svc.state != SshConnectionService.State.CONNECTED) return
+        pendingTmuxWindow = null
+        svc.execTmuxSelectWindow(window) { ok ->
+            if (!ok) {
+                Toast.makeText(
+                    this,
+                    "tmux window '$window' not found",
+                    Toast.LENGTH_SHORT,
+                ).show()
+            }
+        }
+    }
+
+    private fun maybeProbeLiveness() {
+        if (staleConnectionHandled || probeInFlight) return
+        val svc = service ?: return
+        if (svc.state != SshConnectionService.State.CONNECTED) return
+        probeInFlight = true
+        kotlin.concurrent.thread(name = "ssh-probe-caller", isDaemon = true) {
+            val alive = svc.probeLiveness(PROBE_TIMEOUT_MS)
+            runOnUiThread {
+                probeInFlight = false
+                if (!alive) handleStaleConnection()
+            }
+        }
+    }
+
+    private fun handleStaleConnection() {
+        if (staleConnectionHandled) return
+        staleConnectionHandled = true
+        Toast.makeText(this, R.string.terminal_freeze_detected_message, Toast.LENGTH_SHORT).show()
+        service?.shutdown()
+        finish()
     }
 
     private fun startAndBindService() {
@@ -647,12 +792,21 @@ class TerminalActivity : AppCompatActivity() {
      * Rebuild the FAB speed-dial menu. Each [ContextGroup] that contributed a
      * non-empty `fabItems` list becomes one horizontal row; rows are stacked
      * specifity high → low (closest match at the top, "always" at the bottom).
+     *
+     * The bottom row (the "always" group) is augmented with a system-level
+     * secure-input toggle button at its left edge, so the toggle is always
+     * reachable from any context without needing a dedicated row. When the
+     * always group has no FAB items the toggle becomes the row's only entry.
      */
     private fun rebuildFab(rows: List<List<Shortcut>>) {
         val container = binding.fabActions
         container.removeAllViews()
 
-        for (row in rows) {
+        // Ensure there is always at least one row so the system toggle has
+        // somewhere to live.
+        val effectiveRows = if (rows.isEmpty()) listOf(emptyList()) else rows
+        val lastIndex = effectiveRows.size - 1
+        for ((index, row) in effectiveRows.withIndex()) {
             val rowView = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 layoutParams = LinearLayout.LayoutParams(
@@ -660,6 +814,14 @@ class TerminalActivity : AppCompatActivity() {
                     LinearLayout.LayoutParams.WRAP_CONTENT,
                 ).apply { gravity = android.view.Gravity.END }
                 gravity = android.view.Gravity.END
+            }
+            if (index == lastIndex) {
+                val systemBtn = makeAuxButton(getString(R.string.password_mode_label)) {
+                    setSecureInput(!secureInputActive)
+                    setFabExpanded(false)
+                }
+                systemBtn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
+                rowView.addView(systemBtn)
             }
             for (shortcut in row) {
                 val btn = makeAuxButton(shortcut.label) {
@@ -855,7 +1017,7 @@ class TerminalActivity : AppCompatActivity() {
         return (readTmuxPrefixLetter().code - 'a'.code + 1).toByte()
     }
 
-private fun styleModifierButton(button: Button) {
+    private fun styleModifierButton(button: Button) {
         button.background = ContextCompat.getDrawable(this, R.drawable.bg_aux_modifier)
         ContextCompat.getColorStateList(this, R.color.aux_modifier_text)?.let {
             button.setTextColor(it)
@@ -1350,7 +1512,18 @@ private fun styleModifierButton(button: Button) {
 
     private fun writeToSsh(data: ByteArray) {
         service?.writeToSsh(data)
-        bigramTracker.ingestSend(data)
+        if (secureInputActive) {
+            // Bytes during secure input are deliberately kept out of the
+            // bigram tracker so passwords never feed the suggestion row.
+            // CR/LF means the user submitted the password — auto-release
+            // secure mode after a single submission, matching the spec that
+            // a password entry is one-shot.
+            if (data.any { it == 0x0D.toByte() || it == 0x0A.toByte() }) {
+                setSecureInput(false)
+            }
+        } else {
+            bigramTracker.ingestSend(data)
+        }
     }
 
     private fun copySelectedTextToClipboard(text: String?) {
@@ -1629,6 +1802,9 @@ private fun styleModifierButton(button: Button) {
         const val EXTRA_PORT = "port"
         const val EXTRA_USERNAME = "username"
         const val EXTRA_USE_TMUX = "use_tmux"
+        // Deeplink (pss://open?window=...) target. When present, switch to
+        // the named tmux window once the SSH session is connected.
+        const val EXTRA_TMUX_WINDOW = "tmux_window"
         private const val DEFAULT_COLUMNS = 80
         private const val DEFAULT_ROWS = 24
         private const val DEFAULT_FONT_SIZE_PX = 16
@@ -1646,6 +1822,23 @@ private fun styleModifierButton(button: Button) {
         private const val DEFAULT_TMUX_PREFIX_LETTER = "b"
         private const val TAG = "TerminalActivity"
         private const val FAB_COLLAPSED_ALPHA = 0.3f
+        private const val PROBE_TIMEOUT_MS = 4_000L
+
+        // Rolling window of SSH output kept around for password-prompt
+        // detection. A few hundred bytes is plenty — every prompt we look
+        // for fits in well under 100 ASCII chars even with surrounding ANSI
+        // escapes.
+        private const val OUTPUT_TAIL_KEEP_BYTES = 256
+
+        // Strips ANSI CSI sequences (`ESC [ ... <final>`) so prompt-tail
+        // matching sees the visible characters only.
+        private val ANSI_ESCAPE_REGEX = Regex("\\u001B\\[[0-9;?]*[a-zA-Z]")
+
+        // Matches common shell/sudo password prompts at the end of the
+        // visible output. Case-insensitive; covers bare `Password:` /
+        // `password:` (ssh, su) and `[sudo] password for <user>:`.
+        private val PASSWORD_PROMPT_REGEX =
+            Regex("(?i)(?:\\[sudo\\] )?password( for [^:]+)?: ?$")
 
         // Mirrors termux's private DECSET_BIT_BRACKETED_PASTE_MODE (DECSET 2004).
         private const val DECSET_BIT_BRACKETED_PASTE_MODE = 1 shl 10

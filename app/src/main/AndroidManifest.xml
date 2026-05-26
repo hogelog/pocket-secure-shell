@@ -22,11 +22,21 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- pss://open?window=<tmux_window> deeplink. Switches the active
+                 tmux window after the SSH session connects, using saved
+                 credentials. The tmux session is the one this app already
+                 attaches to (`pocketssh`). -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="pss" android:host="open" />
+            </intent-filter>
         </activity>
 
         <activity
             android:name=".ui.TerminalActivity"
-            android:launchMode="singleTop"
+            android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize"
             android:configChanges="keyboard|keyboardHidden|screenSize|orientation" />
 
@@ -53,6 +63,17 @@
 
         <activity
             android:name=".ui.LicensesActivity"
+            android:parentActivityName=".MainActivity" />
+
+        <!-- Diagnostic screens are gated behind a hidden menu (seven taps on the
+             version label). intent-filter is intentionally absent so exported
+             defaults to false and no other app can launch them. -->
+        <activity
+            android:name=".debug.DiagDumpActivity"
+            android:parentActivityName=".MainActivity" />
+
+        <activity
+            android:name=".debug.LogcatActivity"
             android:parentActivityName=".MainActivity" />
 
         <service

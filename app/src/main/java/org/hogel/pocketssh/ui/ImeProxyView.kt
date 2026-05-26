@@ -9,6 +9,7 @@ import android.view.View
 import android.view.inputmethod.BaseInputConnection
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputMethodManager
 import androidx.core.view.ContentInfoCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.inputmethod.EditorInfoCompat
@@ -55,6 +56,20 @@ class ImeProxyView @JvmOverloads constructor(
      */
     var onImageContent: (Uri) -> Unit = {}
 
+    /**
+     * When true, [onCreateInputConnection] advertises the editor as a password
+     * field with personalised learning disabled, so the system IME does not
+     * persist typed bytes into its prediction/auto-correct dictionaries.
+     * Setter triggers an IME restart so the new EditorInfo takes effect.
+     */
+    var secureMode: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+            imm?.restartInput(this)
+        }
+
     init {
         isFocusable = true
         isFocusableInTouchMode = true
@@ -69,11 +84,25 @@ class ImeProxyView @JvmOverloads constructor(
     override fun onCheckIsTextEditor(): Boolean = true
 
     override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection {
-        // TYPE_CLASS_TEXT lets the IME run composition (Japanese kana →
-        // kanji), word suggestions, etc. NO_FULLSCREEN keeps the keyboard
-        // docked instead of taking over the screen in landscape.
-        outAttrs.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_NORMAL
-        outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+        if (secureMode) {
+            // Password variation + NO_PERSONALIZED_LEARNING tells the IME to
+            // disable predictive text and prevent the typed bytes from being
+            // added to the device's auto-correct/learning dictionary, which
+            // is the whole point of the secure-input mode.
+            outAttrs.inputType =
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            outAttrs.imeOptions = EditorInfo.IME_FLAG_NO_FULLSCREEN or
+                EditorInfo.IME_FLAG_NO_EXTRACT_UI or
+                EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+        } else {
+            // TYPE_CLASS_TEXT lets the IME run composition (Japanese kana →
+            // kanji), word suggestions, etc. NO_FULLSCREEN keeps the keyboard
+            // docked instead of taking over the screen in landscape.
+            outAttrs.inputType =
+                InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_NORMAL
+            outAttrs.imeOptions =
+                EditorInfo.IME_FLAG_NO_FULLSCREEN or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+        }
         EditorInfoCompat.setContentMimeTypes(outAttrs, SUPPORTED_IMAGE_MIME_TYPES)
         val ic: InputConnection = ProxyInputConnection(this, true)
         return InputConnectionCompat.createWrapper(this, ic, outAttrs)

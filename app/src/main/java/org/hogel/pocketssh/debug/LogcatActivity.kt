@@ -12,9 +12,10 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 
 /**
- * Debug-only viewer for the app's own logcat output. Android since 4.1
- * scopes third-party logcat reads to the calling process, so `logcat -d`
- * here only returns this app's log entries.
+ * Viewer for the app's own logcat output, reached through the hidden menu
+ * that MainActivity reveals after seven taps on the version label. Android
+ * since 4.1 scopes third-party logcat reads to the calling process, so
+ * `logcat -d` here only returns this app's log entries.
  */
 class LogcatActivity : AppCompatActivity() {
 

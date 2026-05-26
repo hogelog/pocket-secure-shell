@@ -38,6 +38,9 @@
     <string name="connection_failed">Connection failed</string>
     <string name="disconnected">Disconnected</string>
     <string name="disconnect">Disconnect</string>
+    <string name="deeplink_missing_window">pss:// deeplink is missing the required \"window\" parameter.</string>
+    <string name="deeplink_missing_credentials">No saved SSH credentials. Open the app and connect once before using a deeplink.</string>
+    <string name="terminal_freeze_detected_message">Connection appears unresponsive.</string>
     <string name="status_connecting_to">Connecting to %1$s…</string>
     <string name="status_connected_to">Connected to %1$s</string>
     <string name="notification_channel_name">SSH connection</string>
@@ -47,6 +50,8 @@
     <string name="notification_text_connected">Connected to %1$s</string>
     <string name="notification_action_disconnect">Disconnect</string>
     <string name="fab_menu">Menu</string>
+    <string name="password_mode_label">🔒</string>
+    <string name="password_mode_badge_description">Password input mode (tap to exit)</string>
     <string name="swipe_feedback">%1$s (%2$s)</string>
     <string name="swipe_left">Swipe left</string>
     <string name="swipe_right">Swipe right</string>
@@ -156,4 +161,17 @@
     <string name="window_new">New window</string>
     <string name="window_new_label">+</string>
     <string name="window_tab_label">%1$d: %2$s</string>
+
+    <string name="diag_dump_title">Diagnostic dump</string>
+    <string name="diag_dump_copy">Copy</string>
+    <string name="diag_dump_copied">Diagnostic dump copied</string>
+
+    <string name="logcat_title">Logcat</string>
+    <string name="logcat_refresh">Refresh</string>
+    <string name="logcat_copy">Copy</string>
+    <string name="logcat_copied">Logcat copied</string>
+    <string name="logcat_unavailable">Failed to read logcat: %1$s</string>
+
+    <string name="debug_menu_enabled">Debug options enabled</string>
+    <string name="debug_menu_already_enabled">Debug options are already enabled</string>
 </resources>

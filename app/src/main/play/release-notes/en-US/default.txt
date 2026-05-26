@@ -1,3 +1,1 @@
-- Send images directly from your keyboard's image input.
-- Show an upload progress dialog with cancel for image uploads.
-- New native tab strip below the terminal for switching tmux windows.
+- Fixed a hang that could occur when disconnecting from a session.

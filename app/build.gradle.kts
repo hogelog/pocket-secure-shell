@@ -19,7 +19,7 @@ fun requireEnv(name: String): String =
 val prNumber: String? = System.getenv("PR_NUMBER")?.takeIf { it.isNotBlank() }
 val releaseVersion: String? = System.getenv("RELEASE_VERSION")?.takeIf { it.isNotBlank() }
 val releaseVersionSuffix: String? = System.getenv("RELEASE_VERSION_SUFFIX")?.takeIf { it.isNotBlank() }
-val baseVersionName = "0.4.2"
+val baseVersionName = "0.4.5"
 val appVersionName: String = when {
     releaseVersion != null && releaseVersionSuffix != null -> "$releaseVersion-$releaseVersionSuffix"
     releaseVersion != null -> releaseVersion
@@ -38,15 +38,34 @@ val versionForCode: String? = when {
     else -> null
 }
 
+// COMMITS_SINCE_TAG counts commits on main only. PR builds count up to the merge-base with the PR
+// base (BASE_SHA) instead of HEAD, so the PR's own commits never bump versionCode; otherwise builds
+// across PRs get different codes and fail to install over each other as a downgrade. Release/main
+// builds build a commit already on main, so they count HEAD. Outside CI (no BASE_SHA) PR builds
+// fall back to HEAD, where versionCode is irrelevant (no installable artifact is published).
+val countTip: String = if (prNumber != null) {
+    val baseSha = System.getenv("BASE_SHA")?.takeIf { it.isNotBlank() }
+    if (baseSha != null) {
+        providers.exec {
+            commandLine("git", "merge-base", "HEAD", baseSha)
+            isIgnoreExitValue = true
+        }.standardOutput.asText.map { it.trim() }.getOrElse("").ifEmpty { "HEAD" }
+    } else {
+        "HEAD"
+    }
+} else {
+    "HEAD"
+}
+
 val commitsSinceTag: Int = if (versionForCode != null) {
     val prevTag = providers.exec {
-        commandLine("git", "describe", "--tags", "--abbrev=0", "--match=v*", "--exclude=v$versionForCode", "HEAD")
+        commandLine("git", "describe", "--tags", "--abbrev=0", "--match=v*", "--exclude=v$versionForCode", countTip)
         isIgnoreExitValue = true
     }.standardOutput.asText.map { it.trim() }.getOrElse("")
     val countCmd = if (prevTag.isNotEmpty()) {
-        listOf("git", "rev-list", "--count", "$prevTag..HEAD")
+        listOf("git", "rev-list", "--count", "$prevTag..$countTip")
     } else {
-        listOf("git", "rev-list", "--count", "HEAD")
+        listOf("git", "rev-list", "--count", countTip)
     }
     providers.exec {
         commandLine(countCmd)
@@ -154,8 +173,8 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_21
+        targetCompatibility = JavaVersion.VERSION_21
     }
 
     testOptions {
@@ -165,7 +184,7 @@ android {
 
 kotlin {
     compilerOptions {
-        jvmTarget = JvmTarget.JVM_17
+        jvmTarget = JvmTarget.JVM_21
     }
 }
 
@@ -192,7 +211,7 @@ dependencies {
     implementation("org.connectbot:sshlib:2.2.46")
     implementation("androidx.core:core-ktx:1.18.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
-    implementation("com.google.android.material:material:1.13.0")
+    implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")

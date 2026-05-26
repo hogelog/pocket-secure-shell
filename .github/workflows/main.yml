@@ -3,7 +3,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
 
 jobs:
@@ -38,7 +38,7 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       # See release.yml: WIF subject token chain hits roots not in Temurin's
       # bundled cacerts; install ca-certificates-java so publishReleaseBundle works.
@@ -63,14 +63,6 @@ jobs:
         with:
           workload_identity_provider: ${{ vars.GCLOUD_WIF_PROVIDER }}
           service_account: ${{ vars.GCLOUD_SERVICE_ACCOUNT }}
-
-      # Drop maven-publish blocks (unused, broken under Gradle 8+) and rewrite
-      # `proguard-android.txt` to the `-optimize` variant required by AGP 9.0.
-      - name: Patch vendor build scripts
-        run: |
-          for f in vendor/termux-app/terminal-emulator/build.gradle vendor/termux-app/terminal-view/build.gradle; do
-            sed -i "/apply plugin: 'maven-publish'/d; /task sourceJar/,/^}/d; /afterEvaluate/,/^}/d; s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
-          done
 
       - name: Read baseVersionName
         id: base-version
@@ -122,6 +114,28 @@ jobs:
         if: always()
         run: rm -f "${RUNNER_TEMP}/release.keystore"
 
+      - name: Publish main debug prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${HEAD_SHA:0:7}"
+          TAG="main-debug"
+          APK_NAME="pocketsecureshell-main-${SHORT_SHA}-debug.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$APK_NAME"
+          # Replace any existing main-debug release so only the latest main
+          # build is published under this tag.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Deleting previous release ${TAG}"
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            --title "Main debug build (${SHORT_SHA})" \
+            --notes "Automatic debug build of main at ${HEAD_SHA}" \
+            --prerelease \
+            --target "${HEAD_SHA}" \
+            "$APK_NAME"
+
       - name: Upload to DeployGate
         env:
           DEPLOYGATE_API_KEY: ${{ secrets.DEPLOYGATE_API_KEY }}
@@ -163,21 +177,13 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: 21
 
       - uses: android-actions/setup-android@v4
 
       - uses: gradle/actions/setup-gradle@v6
         with:
           cache-write-only: true
-
-      # Drop maven-publish blocks (unused, broken under Gradle 8+) and rewrite
-      # `proguard-android.txt` to the `-optimize` variant required by AGP 9.0.
-      - name: Patch vendor build scripts
-        run: |
-          for f in vendor/termux-app/terminal-emulator/build.gradle vendor/termux-app/terminal-view/build.gradle; do
-            sed -i "/apply plugin: 'maven-publish'/d; /task sourceJar/,/^}/d; /afterEvaluate/,/^}/d; s/proguard-android\.txt/proguard-android-optimize.txt/g" "$f"
-          done
 
       - name: Run lint
         env:

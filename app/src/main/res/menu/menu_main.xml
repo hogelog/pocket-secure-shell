@@ -31,4 +31,16 @@
         android:id="@+id/action_open_repository"
         android:title="@string/open_repository_title"
         app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_diag_dump"
+        android:title="@string/diag_dump_title"
+        android:visible="false"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/action_logcat"
+        android:title="@string/logcat_title"
+        android:visible="false"
+        app:showAsAction="never" />
 </menu>

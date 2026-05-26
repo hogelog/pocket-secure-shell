@@ -25,7 +25,8 @@ import androidx.core.content.edit
 import com.google.android.material.textfield.TextInputEditText
 import com.google.android.material.textfield.TextInputLayout
 import org.hogel.pocketssh.databinding.ActivityMainBinding
-import org.hogel.pocketssh.debug.DebugMenu
+import org.hogel.pocketssh.debug.DiagDumpActivity
+import org.hogel.pocketssh.debug.LogcatActivity
 import org.hogel.pocketssh.settings.SettingsBackup
 import org.hogel.pocketssh.shortcuts.ShortcutStore
 import org.hogel.pocketssh.ssh.SshConnectionService
@@ -46,6 +47,10 @@ class MainActivity : AppCompatActivity() {
     // this and saveConnectionInput persists it on pause, mirroring how the
     // other connection fields are handled.
     private var tmuxPrefix: String = DEFAULT_TMUX_PREFIX
+
+    private var debugMenuUnlocked: Boolean = false
+    private var versionTapCount: Int = 0
+    private var lastVersionTapAt: Long = 0
 
     private var service: SshConnectionService? = null
     private var bindRegistered = false
@@ -76,15 +81,25 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // pss://open?window=... deeplink. If we have saved credentials, forward
+        // to TerminalActivity with the window target and finish() so the main
+        // setup screen does not flash. Otherwise fall through to the normal UI
+        // so the user can fill in the connection details.
+        if (handleDeeplinkIntent(intent)) return
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
         // Wire up the toolbar so the overflow menu (export/import settings) shows.
         setSupportActionBar(binding.toolbar)
 
         binding.textVersion.text = "${BuildConfig.VERSION_NAME}-${BuildConfig.GIT_SHORT_REV}"
+        binding.textVersion.setOnClickListener { onVersionTapped() }
 
         keyManager = SshKeyManager()
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        debugMenuUnlocked = getSharedPreferences(DEBUG_PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_DEBUG_MENU_UNLOCKED, false)
 
         restoreConnectionInput()
         setupConnectionTargetToggle()
@@ -123,8 +138,13 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.menu_main, menu)
-        DebugMenu.inflate(this, menu)
         return true
+    }
+
+    override fun onPrepareOptionsMenu(menu: Menu): Boolean {
+        menu.findItem(R.id.action_diag_dump)?.isVisible = debugMenuUnlocked
+        menu.findItem(R.id.action_logcat)?.isVisible = debugMenuUnlocked
+        return super.onPrepareOptionsMenu(menu)
     }
 
     override fun onOptionsItemSelected(item: MenuItem): Boolean = when (item.itemId) {
@@ -155,7 +175,33 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(getString(R.string.open_repository_url))))
             true
         }
-        else -> if (DebugMenu.handle(this, item)) true else super.onOptionsItemSelected(item)
+        R.id.action_diag_dump -> {
+            startActivity(Intent(this, DiagDumpActivity::class.java))
+            true
+        }
+        R.id.action_logcat -> {
+            startActivity(Intent(this, LogcatActivity::class.java))
+            true
+        }
+        else -> super.onOptionsItemSelected(item)
+    }
+
+    private fun onVersionTapped() {
+        if (debugMenuUnlocked) {
+            Toast.makeText(this, R.string.debug_menu_already_enabled, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val now = android.os.SystemClock.uptimeMillis()
+        versionTapCount = if (now - lastVersionTapAt > VERSION_TAP_TIMEOUT_MS) 1 else versionTapCount + 1
+        lastVersionTapAt = now
+        if (versionTapCount >= VERSION_TAPS_TO_UNLOCK) {
+            debugMenuUnlocked = true
+            versionTapCount = 0
+            getSharedPreferences(DEBUG_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit { putBoolean(KEY_DEBUG_MENU_UNLOCKED, true) }
+            invalidateOptionsMenu()
+            Toast.makeText(this, R.string.debug_menu_enabled, Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun showExportSettingsDialog() {
@@ -225,6 +271,46 @@ class MainActivity : AppCompatActivity() {
 
     private fun resumeTerminal() {
         startActivity(Intent(this, TerminalActivity::class.java))
+    }
+
+    /**
+     * Handle a `pss://open?window=<tmux_window>` intent. Returns true if the
+     * intent was a deeplink and was dispatched (caller should `return` from
+     * onCreate to skip the main UI setup). Returns false for non-deeplink
+     * intents (regular launcher / settings open) so onCreate proceeds normally.
+     *
+     * Saved credentials are required: a cold-start deeplink builds the
+     * connection params from the prefs that the connect form would have used.
+     * If no credentials are saved, the deeplink is logged via a Toast and the
+     * main UI is shown so the user can configure them.
+     */
+    private fun handleDeeplinkIntent(intent: Intent?): Boolean {
+        val uri = intent?.data ?: return false
+        if (uri.scheme != "pss" || uri.host != "open") return false
+        val window = uri.getQueryParameter("window")
+        if (window.isNullOrBlank()) {
+            Toast.makeText(this, R.string.deeplink_missing_window, Toast.LENGTH_LONG).show()
+            return false
+        }
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val host = prefs.getString(KEY_HOST, null)?.takeIf { it.isNotBlank() }
+        val username = prefs.getString(KEY_USERNAME, null)?.takeIf { it.isNotBlank() }
+        if (host == null || username == null) {
+            Toast.makeText(this, R.string.deeplink_missing_credentials, Toast.LENGTH_LONG).show()
+            return false
+        }
+        val port = prefs.getString(KEY_PORT, null)?.toIntOrNull() ?: 22
+        val useTmux = prefs.getBoolean(KEY_USE_TMUX, true)
+        val forward = Intent(this, TerminalActivity::class.java).apply {
+            putExtra(TerminalActivity.EXTRA_HOST, host)
+            putExtra(TerminalActivity.EXTRA_PORT, port)
+            putExtra(TerminalActivity.EXTRA_USERNAME, username)
+            putExtra(TerminalActivity.EXTRA_USE_TMUX, useTmux)
+            putExtra(TerminalActivity.EXTRA_TMUX_WINDOW, window)
+        }
+        startActivity(forward)
+        finish()
+        return true
     }
 
     private fun startConnection() {
@@ -477,5 +563,13 @@ class MainActivity : AppCompatActivity() {
         internal const val KEY_USE_TMUX = "use_tmux"
         internal const val KEY_TMUX_PREFIX = "tmux_prefix"
         private const val DEFAULT_TMUX_PREFIX = "b"
+
+        // Hidden diagnostic menu, unlocked the same way Android's Developer
+        // options screen reveals itself. Kept in its own prefs file so it
+        // never participates in SettingsBackup export/import.
+        private const val DEBUG_PREFS_NAME = "debug"
+        private const val KEY_DEBUG_MENU_UNLOCKED = "menu_unlocked"
+        private const val VERSION_TAPS_TO_UNLOCK = 7
+        private const val VERSION_TAP_TIMEOUT_MS = 3_000L
     }
 }

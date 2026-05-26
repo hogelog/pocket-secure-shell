@@ -8,16 +8,6 @@
              only configuration path. -->
         <meta-data android:name="io.sentry.auto-init" android:value="false" />
 
-        <!-- Diagnostic screens are debug-only; release manifests never see
-             them, so the activities are absent from production APKs. -->
-        <activity
-            android:name=".debug.DiagDumpActivity"
-            android:parentActivityName=".MainActivity" />
-
-        <activity
-            android:name=".debug.LogcatActivity"
-            android:parentActivityName=".MainActivity" />
-
     </application>
 
 </manifest>

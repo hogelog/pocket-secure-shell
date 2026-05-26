@@ -1,5 +1,6 @@
 package org.hogel.pocketssh.ssh
 
+import com.trilead.ssh2.ChannelCondition
 import com.trilead.ssh2.Connection
 import com.trilead.ssh2.SCPClient
 import com.trilead.ssh2.ServerHostKeyVerifier
@@ -86,23 +87,13 @@ class SshSession(
             // Status bar is replaced by the native TabLayout, so hide tmux's
             // own one. Users with a customized status will notice this.
             append("set-option -g status off \\; ")
-            // No `set-hook ... refresh-client` here. The first cut wired
-            // window-linked / window-unlinked / window-renamed to
-            // `refresh-client` to force a title re-emit, but with
-            // `automatic-rename on` (the tmux default) `window-renamed`
-            // fires every time a pane's foreground command changes, and
-            // `refresh-client` dumps the entire pane contents to the
-            // attached client. Active sessions then flood the SSH channel
-            // fast enough to fill the server's send buffer; tmux blocks on
-            // write, can no longer service input from stdin, and the
-            // client sees a permanently frozen terminal and tab strip.
-            //
-            // We rely on the natural triggers instead: switching window
-            // (create / close / `prefix n` / tab tap) changes the active
-            // pane, which changes `pane_current_command`, which marks the
-            // title dirty and re-emits it. Renaming a non-active window
-            // lags until the next redraw cycle picks it up — acceptable for
-            // a tab strip that is mostly used for switch, not for inspect.
+            // Deliberately no `set-hook ... refresh-client`: it dumps the
+            // whole pane to the client on every title re-emit and floods the
+            // SSH channel until tmux blocks on write and the terminal freezes.
+            // Title updates ride the natural triggers instead — switching
+            // window changes `pane_current_command`, which marks the title
+            // dirty. Renaming a non-active window lags until the next redraw,
+            // acceptable for a switch-oriented tab strip.
             append("new-session -A -s ")
             append(TMUX_SESSION_NAME)
         }
@@ -130,9 +121,51 @@ class SshSession(
         SCPClient(conn).put(bytes, filename, remoteDir)
     }
 
+    /**
+     * Run a one-shot command on a separate SSH session over the same connection.
+     * Blocks until the remote command exits or [timeoutMs] elapses. Returns the
+     * remote exit status (or -1 on timeout / missing status). The interactive
+     * shell session is unaffected. Call from a background thread.
+     */
+    fun execCommand(command: String, timeoutMs: Long = 5_000): Int {
+        val conn = connection ?: throw IllegalStateException("Not connected")
+        val sess = conn.openSession()
+        try {
+            sess.execCommand(command)
+            // Drain stdout/stderr so the remote can flush and exit cleanly.
+            drain(sess.stdout)
+            drain(sess.stderr)
+            sess.waitForCondition(
+                ChannelCondition.EXIT_STATUS or ChannelCondition.CLOSED,
+                timeoutMs,
+            )
+            return sess.exitStatus ?: -1
+        } finally {
+            try { sess.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun drain(input: InputStream) {
+        val buf = ByteArray(1024)
+        try {
+            while (input.read(buf) > 0) { /* discard */ }
+        } catch (_: Exception) { /* channel closed */ }
+    }
+
     /** Send an SSH_MSG_IGNORE packet to keep NAT/firewall mappings warm. */
     fun sendKeepalive() {
         connection?.sendIgnorePacket()
+    }
+
+    /**
+     * Round-trip liveness check: sends `SSH_MSG_GLOBAL_REQUEST
+     * keepalive@openssh.com` with want_reply=true and blocks until the server
+     * answers (with REQUEST_FAILURE, which is the expected reply). On a
+     * half-open socket this never returns, so the caller must invoke this on a
+     * worker thread and time it out externally.
+     */
+    fun ping() {
+        connection?.ping() ?: throw IllegalStateException("Not connected")
     }
 
     fun disconnect() {
