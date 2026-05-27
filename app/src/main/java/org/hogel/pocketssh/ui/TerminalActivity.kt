@@ -680,7 +680,7 @@ class TerminalActivity : AppCompatActivity() {
      * Rebuild the shortcut bar. The bottom row flattens every matching
      * [ContextGroup] into a single horizontally-scrolling line, ordered
      * specifity high → low so the active foreground command's deck sits
-     * left of the always-on `/`–`^D` slice. The learned-suggestions row
+     * left of the always-on slice. The learned-suggestions row
      * stays above it when bigram counts yield candidates for the active
      * `(context, prev)`. Ctrl is the left-most button on the bottom row as
      * a sticky modifier toggle; it can't be expressed inside a
