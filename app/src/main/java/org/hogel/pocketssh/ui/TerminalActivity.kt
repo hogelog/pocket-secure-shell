@@ -790,51 +790,41 @@ class TerminalActivity : AppCompatActivity() {
 
     /**
      * Rebuild the FAB speed-dial menu. Each [ContextGroup] that contributed a
-     * non-empty `fabItems` list becomes one horizontal row; rows are stacked
-     * specifity high → low (closest match at the top, "always" at the bottom).
-     *
-     * The bottom row (the "always" group) is augmented with a system-level
-     * secure-input toggle button at its left edge, so the toggle is always
-     * reachable from any context without needing a dedicated row. When the
-     * always group has no FAB items the toggle becomes the row's only entry.
+     * non-empty `fabItems` list becomes one or more horizontal rows, wrapping
+     * at [FAB_MAX_COLUMNS] buttons; rows are stacked specifity high → low
+     * (closest match at the top, "always" at the bottom). The secure-input
+     * toggle is an ordinary `{SECURE-INPUT}` item in the bundled defaults, so
+     * everything here is just the resolved shortcuts.
      */
     private fun rebuildFab(rows: List<List<Shortcut>>) {
         val container = binding.fabActions
         container.removeAllViews()
 
-        // Ensure there is always at least one row so the system toggle has
-        // somewhere to live.
-        val effectiveRows = if (rows.isEmpty()) listOf(emptyList()) else rows
-        val lastIndex = effectiveRows.size - 1
-        for ((index, row) in effectiveRows.withIndex()) {
-            val rowView = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { gravity = android.view.Gravity.END }
-                gravity = android.view.Gravity.END
-            }
-            if (index == lastIndex) {
-                val systemBtn = makeAuxButton(getString(R.string.password_mode_label)) {
-                    setSecureInput(!secureInputActive)
-                    setFabExpanded(false)
+        for (row in rows) {
+            // Wrap a wide group into stacked rows of at most FAB_MAX_COLUMNS so
+            // the buttons stay thumb-reachable instead of running off-screen.
+            for (chunk in row.chunked(FAB_MAX_COLUMNS)) {
+                val rowView = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { gravity = android.view.Gravity.END }
+                    gravity = android.view.Gravity.END
                 }
-                systemBtn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
-                rowView.addView(systemBtn)
-            }
-            for (shortcut in row) {
-                val btn = makeAuxButton(shortcut.label) {
-                    runShortcutActions(parseShortcutActions(shortcut.payload))
-                    setFabExpanded(false)
+                for (shortcut in chunk) {
+                    val btn = makeAuxButton(shortcut.label) {
+                        runShortcutActions(parseShortcutActions(shortcut.payload))
+                        setFabExpanded(false)
+                    }
+                    // Override the bar-button background with the FAB variant —
+                    // same fill but with a 1dp stroke, so adjacent buttons render
+                    // thin inter-cell borders without a divider mechanism.
+                    btn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
+                    rowView.addView(btn)
                 }
-                // Override the bar-button background with the FAB variant —
-                // same fill but with a 1dp stroke, so adjacent buttons render
-                // thin inter-cell borders without a divider mechanism.
-                btn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
-                rowView.addView(btn)
+                container.addView(rowView)
             }
-            container.addView(rowView)
         }
     }
 
@@ -852,6 +842,7 @@ class TerminalActivity : AppCompatActivity() {
             is ShortcutAction.Copy -> startTextSelection()
             is ShortcutAction.Paste -> pasteClipboardToSsh()
             is ShortcutAction.ImagePaste -> launchImagePicker()
+            is ShortcutAction.SecureInput -> setSecureInput(!secureInputActive)
         }
         clearStickyModifiers()
     }
@@ -1821,6 +1812,7 @@ class TerminalActivity : AppCompatActivity() {
         private const val DEFAULT_TMUX_PREFIX_LETTER = "b"
         private const val TAG = "TerminalActivity"
         private const val FAB_COLLAPSED_ALPHA = 0.3f
+        private const val FAB_MAX_COLUMNS = 3
         private const val PROBE_TIMEOUT_MS = 4_000L
 
         // Rolling window of SSH output kept around for password-prompt

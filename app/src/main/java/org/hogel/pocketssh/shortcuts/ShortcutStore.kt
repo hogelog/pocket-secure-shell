@@ -66,8 +66,12 @@ class ShortcutStore(context: Context) {
                     Shortcut("^D", "^D"),
                 ),
                 fabItems = listOf(
+                    Shortcut("\uD83D\uDD12", "{SECURE-INPUT}"), // 🔒 secure input toggle
+                    Shortcut("⌃C", "^C"),
+                    Shortcut("⌃D", "^D"),
                     Shortcut("\uD83D\uDDBC", "{IMAGE-PASTE}"), // 🖼 image picker
                     Shortcut("\uD83D\uDCCB", "{COPY}"),        // 📋 selection mode
+                    Shortcut("\uD83D\uDCE5", "{PASTE}"),       // 📥 paste clipboard
                 ),
             ),
             // Swipe direction mirrors the FAB arrows: ⬅️ / swipe-left =

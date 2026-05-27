@@ -41,6 +41,13 @@ sealed class ShortcutAction {
      * to the remote host. The handler decides what to do with the picked URI.
      */
     object ImagePaste : ShortcutAction()
+
+    /**
+     * Toggle the terminal's secure text-input mode, which suppresses the IME's
+     * prediction and bigram learning. The handler reads and flips the current
+     * state.
+     */
+    object SecureInput : ShortcutAction()
 }
 
 /**
@@ -63,6 +70,7 @@ sealed class ShortcutAction {
  *   `{COPY}`        — enter the terminal's text-selection / copy mode
  *   `{PASTE}`       — paste the system clipboard text into ssh stdin
  *   `{IMAGE-PASTE}` — open the image picker so the user can upload an image
+ *   `{SECURE-INPUT}` — toggle the secure text-input mode (the 🔒 lock)
  *
  * Anything else is sent verbatim as UTF-8.
  *
@@ -163,5 +171,6 @@ private fun keyTokenAction(token: String): ShortcutAction? = when (token.upperca
     "COPY" -> ShortcutAction.Copy
     "PASTE" -> ShortcutAction.Paste
     "IMAGE-PASTE", "IMAGE_PASTE" -> ShortcutAction.ImagePaste
+    "SECURE-INPUT", "SECURE_INPUT" -> ShortcutAction.SecureInput
     else -> null
 }
