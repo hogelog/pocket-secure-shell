@@ -50,7 +50,6 @@
     <string name="notification_text_connected">Connected to %1$s</string>
     <string name="notification_action_disconnect">Disconnect</string>
     <string name="fab_menu">Menu</string>
-    <string name="password_mode_label">🔒</string>
     <string name="password_mode_badge_description">Password input mode (tap to exit)</string>
     <string name="swipe_feedback">%1$s (%2$s)</string>
     <string name="swipe_left">Swipe left</string>
@@ -92,7 +91,7 @@
     <string name="shortcuts_glyph_up">↑</string>
     <string name="shortcuts_glyph_down">↓</string>
     <string name="shortcuts_glyph_delete">✕</string>
-    <string name="shortcuts_payload_help">Payload escapes: \\e ESC · \\t \\r \\n bytes · \\xNN hex byte · ^A–^Z Ctrl-A..Z · {UP} {DOWN} {LEFT} {RIGHT} {TAB} {S-TAB} key codes · {TMUX-PREFIX} prefix byte · {COPY} {PASTE} {IMAGE-PASTE} clipboard actions. Other text is sent as UTF-8.</string>
+    <string name="shortcuts_payload_help">Payload escapes: \\e ESC · \\t \\r \\n bytes · \\xNN hex byte · ^A–^Z Ctrl-A..Z · {UP} {DOWN} {LEFT} {RIGHT} {TAB} {S-TAB} key codes · {TMUX-PREFIX} prefix byte · {COPY} {PASTE} {IMAGE-PASTE} clipboard actions · {SECURE-INPUT} lock toggle. Other text is sent as UTF-8.</string>
     <string name="group_editor_title">Edit group</string>
     <string name="group_name_hint">Name</string>
     <string name="group_use_tmux">Match only when tmux is in use</string>
