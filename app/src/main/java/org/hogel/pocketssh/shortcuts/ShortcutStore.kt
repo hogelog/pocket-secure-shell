@@ -62,8 +62,6 @@ class ShortcutStore(context: Context) {
                     Shortcut("^R", "^R"),
                     Shortcut("↓", "{DOWN}"),
                     Shortcut("↑", "{UP}"),
-                    Shortcut("^C", "^C"),
-                    Shortcut("^D", "^D"),
                 ),
                 fabItems = listOf(
                     Shortcut("\uD83D\uDD12", "{SECURE-INPUT}"), // 🔒 secure input toggle
