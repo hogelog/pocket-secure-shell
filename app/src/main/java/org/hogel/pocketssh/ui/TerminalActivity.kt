@@ -823,12 +823,19 @@ class TerminalActivity : AppCompatActivity() {
                     // thin inter-cell borders without a divider mechanism.
                     btn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
                     // Reveal the payload in the center overlay while pressed so the
-                    // emoji label stays decipherable. Returning false keeps the
-                    // click handler firing on release (skipped if the touch slides
-                    // off the button), so a press can also just be a peek.
-                    btn.setOnTouchListener { _, event ->
+                    // emoji label stays decipherable, hiding it as soon as the touch
+                    // slides off the button (which also cancels the click). Returning
+                    // false keeps the click handler firing on release, so a press can
+                    // be a peek-only confirmation.
+                    btn.setOnTouchListener { v, event ->
                         when (event.actionMasked) {
                             MotionEvent.ACTION_DOWN -> showPayloadFeedback(shortcut)
+                            MotionEvent.ACTION_MOVE ->
+                                if (event.x in 0f..v.width.toFloat() && event.y in 0f..v.height.toFloat()) {
+                                    showPayloadFeedback(shortcut)
+                                } else {
+                                    hideSwipeFeedback()
+                                }
                             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> hideSwipeFeedback()
                         }
                         false
