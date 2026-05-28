@@ -58,6 +58,7 @@ class ShortcutStore(context: Context) {
                 name = "always",
                 shortcuts = listOf(
                     Shortcut("TAB", "{TAB}"),
+                    Shortcut("^C", "^C"),
                     Shortcut("^L", "^L"),
                     Shortcut("^R", "^R"),
                     Shortcut("↓", "{DOWN}"),
