@@ -47,7 +47,7 @@ With `useTmux=false` (or before tmux emits a title) the context falls back to
 `ShortcutPayload.parseShortcutActions` accepts byte escapes (`\e`, `\xNN`, `\t`/`\r`/`\n`),
 caret-Ctrl (`^A`–`^Z`, `^[` etc.), key tokens routed through `KeyHandler`
 (`{UP}` `{DOWN}` `{LEFT}` `{RIGHT}` `{TAB}` `{S-TAB}`), and dynamic actions
-(`{TMUX-PREFIX}` `{COPY}` `{PASTE}` `{IMAGE-PASTE}`). Keep the parser and the
+(`{TMUX-PREFIX}` `{COPY}` `{PASTE}` `{IMAGE-PASTE}` `{SECURE-INPUT}` `{CTRL-INPUT}`). Keep the parser and the
 `shortcuts_payload_help` string in `res/values/strings.xml` in sync — that string is the
 user-facing reference.
 

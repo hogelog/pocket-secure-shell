@@ -17,6 +17,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.text.InputFilter
+import android.text.InputType
 import android.util.Log
 import android.util.TypedValue
 import android.view.GestureDetector
@@ -28,10 +30,12 @@ import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -862,6 +866,7 @@ class TerminalActivity : AppCompatActivity() {
             is ShortcutAction.Paste -> pasteClipboardToSsh()
             is ShortcutAction.ImagePaste -> launchImagePicker()
             is ShortcutAction.SecureInput -> setSecureInput(!secureInputActive)
+            is ShortcutAction.CtrlInput -> showControlInputDialog()
         }
         clearStickyModifiers()
     }
@@ -877,6 +882,69 @@ class TerminalActivity : AppCompatActivity() {
             .alpha(if (expanded) 1f else FAB_COLLAPSED_ALPHA)
             .setDuration(150)
             .start()
+    }
+
+    /**
+     * Show the control-input dialog: a grid of common Ctrl sequences plus a
+     * one-character field for any other letter. Every entry is sent by feeding
+     * a `^X` payload back through [parseShortcutActions], so the C0 mapping
+     * stays in one place ([ctrlByteFor]).
+     */
+    private fun showControlInputDialog() {
+        val pad = dpToPx(16)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+
+        var dialog: AlertDialog? = null
+        fun send(payload: String) {
+            runShortcutActions(parseShortcutActions(payload))
+            dialog?.dismiss()
+        }
+
+        CTRL_INPUT_PRESETS.chunked(CTRL_INPUT_COLUMNS).forEach { chunk ->
+            val rowView = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (preset in chunk) {
+                val btn = makeAuxButton(preset) { send(preset) }
+                btn.layoutParams = auxButtonLayoutParams()
+                rowView.addView(btn)
+            }
+            root.addView(rowView)
+        }
+
+        val edit = EditText(this).apply {
+            hint = getString(R.string.ctrl_input_hint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            filters = arrayOf(InputFilter.LengthFilter(1))
+            minWidth = dpToPx(64)
+        }
+        fun sendTyped(): Boolean {
+            val ch = edit.text.toString().firstOrNull() ?: return false
+            send("^$ch")
+            return true
+        }
+        edit.setOnEditorActionListener { _, _, _ -> sendTyped() }
+
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dpToPx(2), dpToPx(12), dpToPx(2), 0)
+            addView(TextView(this@TerminalActivity).apply { text = getString(R.string.ctrl_input_prefix) })
+            addView(edit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(
+                makeAuxButton(getString(R.string.ctrl_input_send)) { sendTyped() }
+                    .apply { layoutParams = auxButtonLayoutParams() },
+            )
+        }
+        root.addView(inputRow)
+
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.ctrl_input_title)
+            .setView(root)
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        dialog.show()
     }
 
     private fun launchImagePicker() {
@@ -1837,6 +1905,9 @@ class TerminalActivity : AppCompatActivity() {
         private const val TAG = "TerminalActivity"
         private const val FAB_COLLAPSED_ALPHA = 0.3f
         private const val FAB_MAX_COLUMNS = 3
+        private const val CTRL_INPUT_COLUMNS = 4
+        private val CTRL_INPUT_PRESETS =
+            listOf("^C", "^D", "^L", "^R", "^Z", "^A", "^E", "^U", "^K", "^W", "^[")
         private const val PROBE_TIMEOUT_MS = 4_000L
 
         // Rolling window of SSH output kept around for password-prompt

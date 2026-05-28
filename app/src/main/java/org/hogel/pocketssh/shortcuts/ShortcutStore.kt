@@ -59,15 +59,12 @@ class ShortcutStore(context: Context) {
                 shortcuts = listOf(
                     Shortcut("TAB", "{TAB}"),
                     Shortcut("^C", "^C"),
-                    Shortcut("^L", "^L"),
-                    Shortcut("^R", "^R"),
                     Shortcut("↓", "{DOWN}"),
                     Shortcut("↑", "{UP}"),
                 ),
                 fabItems = listOf(
                     Shortcut("\uD83D\uDD12", "{SECURE-INPUT}"), // 🔒 secure input toggle
-                    Shortcut("⌃C", "^C"),
-                    Shortcut("⌃D", "^D"),
+                    Shortcut("⌨️", "{CTRL-INPUT}"), // control-input dialog (^C/^D/^L/^R/…)
                     Shortcut("\uD83D\uDDBC", "{IMAGE-PASTE}"), // 🖼 image picker
                     Shortcut("\uD83D\uDCCB", "{COPY}"),        // 📋 selection mode
                     Shortcut("\uD83D\uDCE5", "{PASTE}"),       // 📥 paste clipboard
