@@ -58,6 +58,7 @@ class ShortcutStore(context: Context) {
                 name = "always",
                 shortcuts = listOf(
                     Shortcut("TAB", "{TAB}"),
+                    Shortcut("^C", "^C"),
                     Shortcut("^L", "^L"),
                     Shortcut("^R", "^R"),
                     Shortcut("↓", "{DOWN}"),
@@ -85,7 +86,7 @@ class ShortcutStore(context: Context) {
                 swipeLeft = Shortcut("⬅️", "{TMUX-PREFIX}p"),
                 swipeRight = Shortcut("➡️", "{TMUX-PREFIX}n"),
             ),
-            // Control-byte payloads only (ESC, ^C, Shift-Tab, ^J): the bigram
+            // Control-byte payloads only (ESC, Shift-Tab, ^J): the bigram
             // tracker can't observe control sequences (it poisons the line on
             // the first byte `< 0x20`), so they have to stay as fixed buttons.
             // Plain-text tokens are surfaced by the tracker from real usage.
@@ -94,7 +95,6 @@ class ShortcutStore(context: Context) {
                 contexts = listOf("claude"),
                 shortcuts = listOf(
                     Shortcut("ESC", "\\e"),
-                    Shortcut("^C", "^C"),
                     Shortcut("⇧Tab", "{S-TAB}"),
                     Shortcut("^J", "^J"),
                 ),
