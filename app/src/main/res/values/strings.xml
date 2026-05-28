@@ -60,6 +60,10 @@
     <string name="image_upload_failed">Image upload failed: %1$s</string>
     <string name="image_upload_read_failed">Failed to read image</string>
     <string name="image_upload_not_connected">Not connected</string>
+    <string name="ctrl_input_title">Control input</string>
+    <string name="ctrl_input_prefix">Ctrl +</string>
+    <string name="ctrl_input_hint">key</string>
+    <string name="ctrl_input_send">Send</string>
     <string name="section_shortcuts">Shortcuts</string>
     <string name="toggle_shortcuts">Toggle shortcuts</string>
     <string name="shortcuts_settings_title">Shortcuts</string>
@@ -91,7 +95,7 @@
     <string name="shortcuts_glyph_up">↑</string>
     <string name="shortcuts_glyph_down">↓</string>
     <string name="shortcuts_glyph_delete">✕</string>
-    <string name="shortcuts_payload_help">Payload escapes: \\e ESC · \\t \\r \\n bytes · \\xNN hex byte · ^A–^Z Ctrl-A..Z · {UP} {DOWN} {LEFT} {RIGHT} {TAB} {S-TAB} key codes · {TMUX-PREFIX} prefix byte · {COPY} {PASTE} {IMAGE-PASTE} clipboard actions · {SECURE-INPUT} lock toggle. Other text is sent as UTF-8.</string>
+    <string name="shortcuts_payload_help">Payload escapes: \\e ESC · \\t \\r \\n bytes · \\xNN hex byte · ^A–^Z Ctrl-A..Z · {UP} {DOWN} {LEFT} {RIGHT} {TAB} {S-TAB} key codes · {TMUX-PREFIX} prefix byte · {COPY} {PASTE} {IMAGE-PASTE} clipboard actions · {SECURE-INPUT} lock toggle · {CTRL-INPUT} control-input dialog. Other text is sent as UTF-8.</string>
     <string name="group_editor_title">Edit group</string>
     <string name="group_name_hint">Name</string>
     <string name="group_use_tmux">Match only when tmux is in use</string>

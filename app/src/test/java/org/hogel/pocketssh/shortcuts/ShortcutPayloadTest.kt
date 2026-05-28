@@ -195,6 +195,8 @@ class ShortcutPayloadTest {
         assertTrue(parseShortcutActions("{PASTE}").single() === ShortcutAction.Paste)
         assertTrue(parseShortcutActions("{IMAGE-PASTE}").single() === ShortcutAction.ImagePaste)
         assertTrue(parseShortcutActions("{IMAGE_PASTE}").single() === ShortcutAction.ImagePaste)
+        assertTrue(parseShortcutActions("{CTRL-INPUT}").single() === ShortcutAction.CtrlInput)
+        assertTrue(parseShortcutActions("{CTRL_INPUT}").single() === ShortcutAction.CtrlInput)
     }
 
     @Test

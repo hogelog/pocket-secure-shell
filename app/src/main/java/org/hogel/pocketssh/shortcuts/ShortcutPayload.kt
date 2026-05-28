@@ -48,6 +48,13 @@ sealed class ShortcutAction {
      * state.
      */
     object SecureInput : ShortcutAction()
+
+    /**
+     * Open the control-input dialog, which sends an arbitrary Ctrl-<letter>
+     * sequence (e.g. ^L, ^R) chosen from a preset grid or a one-character
+     * input field. The handler builds and shows the dialog.
+     */
+    object CtrlInput : ShortcutAction()
 }
 
 /**
@@ -71,6 +78,7 @@ sealed class ShortcutAction {
  *   `{PASTE}`       — paste the system clipboard text into ssh stdin
  *   `{IMAGE-PASTE}` — open the image picker so the user can upload an image
  *   `{SECURE-INPUT}` — toggle the secure text-input mode (the 🔒 lock)
+ *   `{CTRL-INPUT}`  — open the control-input dialog (preset / arbitrary ^X)
  *
  * Anything else is sent verbatim as UTF-8.
  *
@@ -172,5 +180,6 @@ private fun keyTokenAction(token: String): ShortcutAction? = when (token.upperca
     "PASTE" -> ShortcutAction.Paste
     "IMAGE-PASTE", "IMAGE_PASTE" -> ShortcutAction.ImagePaste
     "SECURE-INPUT", "SECURE_INPUT" -> ShortcutAction.SecureInput
+    "CTRL-INPUT", "CTRL_INPUT" -> ShortcutAction.CtrlInput
     else -> null
 }
