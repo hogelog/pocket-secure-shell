@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
@@ -13,6 +14,8 @@ import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -31,9 +34,11 @@ import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ArrayAdapter
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
@@ -65,6 +70,7 @@ import org.hogel.pocketssh.shortcuts.resolve
 import org.hogel.pocketssh.ssh.BiometricAuthenticationException
 import org.hogel.pocketssh.ssh.BiometricAuthenticator
 import org.hogel.pocketssh.ssh.HostKeyPrompt
+import org.hogel.pocketssh.ssh.RemoteListing
 import org.hogel.pocketssh.ssh.SshConnectionService
 import org.hogel.pocketssh.ssh.SshKeyManager
 import org.hogel.pocketssh.tmux.TmuxTitle
@@ -231,6 +237,15 @@ class TerminalActivity : AppCompatActivity() {
     // the activity tears down mid-upload.
     private var uploadDialog: AlertDialog? = null
 
+    // Active SCP file-browser and transfer-progress dialogs, plus the directory
+    // a pending upload targets. Held so onDestroy can dismiss any open window
+    // and the document picker callback knows where to put the file.
+    private var scpBrowserDialog: AlertDialog? = null
+    private var scpTransferDialog: AlertDialog? = null
+    private var scpUploadTargetDir: String? = null
+    private var scpBrowserListView: ListView? = null
+    private var scpBrowserPathHeader: TextView? = null
+
     private var fontSizePx = DEFAULT_FONT_SIZE_PX
     private val terminalPrefs by lazy { getSharedPreferences(PREFS_TERMINAL, Context.MODE_PRIVATE) }
     private val shortcutStore by lazy { ShortcutStore(this) }
@@ -324,6 +339,13 @@ class TerminalActivity : AppCompatActivity() {
     private val imagePickerLauncher = registerForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri -> if (uri != null) onImagePicked(uri) }
+
+    // SAF file picker for SCP upload. The chosen file is uploaded into
+    // [scpUploadTargetDir], the directory the browser was showing when the
+    // user tapped "Upload here".
+    private val scpUploadPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) onScpUploadFilePicked(uri) }
 
     private val outputListener: (ByteArray) -> Unit = ::handleSshOutput
 
@@ -863,8 +885,8 @@ class TerminalActivity : AppCompatActivity() {
             is ShortcutAction.SendKey -> sendKeyCode(action.keyCode, action.keyMod)
             is ShortcutAction.SendTmuxPrefix -> writeToSsh(byteArrayOf(readTmuxPrefixByte()))
             is ShortcutAction.Copy -> startTextSelection()
-            is ShortcutAction.Paste -> pasteClipboardToSsh()
             is ShortcutAction.ImagePaste -> launchImagePicker()
+            is ShortcutAction.Scp -> launchScpBrowser()
             is ShortcutAction.SecureInput -> setSecureInput(!secureInputActive)
             is ShortcutAction.CtrlInput -> showControlInputDialog()
         }
@@ -1048,6 +1070,282 @@ class TerminalActivity : AppCompatActivity() {
         "image/heic" -> "heic"
         "image/heif" -> "heif"
         else -> "png"
+    }
+
+    /**
+     * Open the two-way SCP/SFTP file browser, starting at the login home (`.`
+     * resolves to it server-side). Inside the browser the user navigates remote
+     * directories, taps a file to download it to the device Downloads folder, or
+     * taps "Upload here" to push a local file into the current directory.
+     */
+    private fun launchScpBrowser() {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        scpNavigate(".")
+    }
+
+    /** List [path] over SFTP and (re)render the browser dialog, or toast on failure. */
+    private fun scpNavigate(path: String) {
+        val svc = service ?: return
+        svc.listRemoteDir(path) { result ->
+            result.fold(
+                onSuccess = { showScpListing(it) },
+                onFailure = { e ->
+                    // e.message is shown only in a local toast, never sent anywhere.
+                    Toast.makeText(
+                        this,
+                        getString(R.string.scp_list_failed, e.message ?: ""),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                },
+            )
+        }
+    }
+
+    private fun showScpListing(listing: RemoteListing) {
+        val path = listing.path
+        val labels = mutableListOf<String>()
+        val onClick = mutableListOf<() -> Unit>()
+        if (path != "/") {
+            labels.add("⬆  ..")
+            onClick.add { scpNavigate(joinRemotePath(path, "..")) }
+        }
+        for (entry in listing.entries) {
+            if (entry.name == "." || entry.name == "..") continue
+            val target = joinRemotePath(path, entry.name)
+            if (entry.isDirectory) {
+                labels.add("📁  ${entry.name}/")
+                onClick.add { scpNavigate(target) }
+            } else {
+                labels.add("📄  ${entry.name}")
+                onClick.add { confirmScpDownload(target, entry.name) }
+            }
+        }
+        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
+
+        val existing = scpBrowserDialog
+        if (existing != null && existing.isShowing) {
+            scpBrowserPathHeader?.text = path
+            scpBrowserListView?.let { list ->
+                list.adapter = adapter
+                list.setOnItemClickListener { _, _, pos, _ -> onClick[pos]() }
+            }
+            return
+        }
+
+        val pad = dpToPx(16)
+        val header = TextView(this).apply {
+            text = path
+            setPadding(pad, pad, pad, dpToPx(8))
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        val list = ListView(this).apply {
+            this.adapter = adapter
+            setOnItemClickListener { _, _, pos, _ -> onClick[pos]() }
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(header)
+            addView(
+                list,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(360)),
+            )
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.scp_browser_title)
+            .setView(container)
+            .setNeutralButton(R.string.scp_upload_here, null)
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        scpBrowserListView = list
+        scpBrowserPathHeader = header
+        scpBrowserDialog = dialog
+        dialog.setOnDismissListener {
+            scpBrowserDialog = null
+            scpBrowserListView = null
+            scpBrowserPathHeader = null
+        }
+        dialog.show()
+        // Override the neutral button after show() so it does NOT auto-dismiss
+        // on the navigation taps; for upload it reads the *current* directory
+        // (header text changes as the user navigates), then closes and opens
+        // the document picker.
+        dialog.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener {
+            scpUploadTargetDir = scpBrowserPathHeader?.text?.toString() ?: path
+            dialog.dismiss()
+            scpUploadPickerLauncher.launch(arrayOf("*/*"))
+        }
+    }
+
+    /** Join a remote dir and a child name with `/`; `..` is resolved server-side. */
+    private fun joinRemotePath(dir: String, name: String): String =
+        if (dir.endsWith("/")) "$dir$name" else "$dir/$name"
+
+    private fun confirmScpDownload(remotePath: String, displayName: String) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.scp_download_confirm_title)
+            .setMessage(getString(R.string.scp_download_confirm_message, displayName))
+            .setPositiveButton(android.R.string.ok) { _, _ -> startScpDownload(remotePath, displayName) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * Download [remotePath] into a new MediaStore Downloads entry named
+     * [displayName]. A cancelable progress dialog blocks until the SFTP worker
+     * finishes; canceling interrupts the worker and removes the pending entry.
+     */
+    private fun startScpDownload(remotePath: String, displayName: String) {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val resolver = contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, displayName)
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val targetUri = resolver.insert(collection, values)
+        if (targetUri == null) {
+            Toast.makeText(this, getString(R.string.scp_download_failed, ""), Toast.LENGTH_LONG).show()
+            return
+        }
+        val out = try {
+            resolver.openOutputStream(targetUri)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open download sink")
+            null
+        }
+        if (out == null) {
+            resolver.delete(targetUri, null, null)
+            Toast.makeText(this, getString(R.string.scp_download_failed, ""), Toast.LENGTH_LONG).show()
+            return
+        }
+
+        val cancelled = AtomicBoolean(false)
+        val dialog = buildScpProgressDialog(R.string.scp_downloading)
+        val future = svc.downloadFile(remotePath, out) { error ->
+            try { out.close() } catch (_: Exception) {}
+            if (cancelled.get()) return@downloadFile
+            scpTransferDialog = null
+            dialog.dismiss()
+            if (error == null) {
+                val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+                resolver.update(targetUri, done, null, null)
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_download_done, displayName),
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                resolver.delete(targetUri, null, null)
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_download_failed, error.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        dialog.setButton(
+            DialogInterface.BUTTON_NEGATIVE,
+            getString(android.R.string.cancel),
+        ) { _, _ ->
+            cancelled.set(true)
+            scpTransferDialog = null
+            future?.cancel(true)
+            try { out.close() } catch (_: Exception) {}
+            resolver.delete(targetUri, null, null)
+            Toast.makeText(this, R.string.scp_download_cancelled, Toast.LENGTH_SHORT).show()
+        }
+        scpTransferDialog = dialog
+        dialog.show()
+    }
+
+    /** Upload the SAF-picked [uri] into [scpUploadTargetDir] captured at pick time. */
+    private fun onScpUploadFilePicked(uri: Uri) {
+        val remoteDir = scpUploadTargetDir
+        scpUploadTargetDir = null
+        if (remoteDir == null) return
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val displayName = queryDisplayName(uri) ?: "upload.bin"
+        val bytes = try {
+            contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read picked file", e)
+            null
+        }
+        if (bytes == null) {
+            Toast.makeText(this, R.string.scp_upload_read_failed, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val cancelled = AtomicBoolean(false)
+        val dialog = buildScpProgressDialog(R.string.scp_uploading)
+        val future = svc.uploadBytes(bytes, displayName, remoteDir) { error ->
+            if (cancelled.get()) return@uploadBytes
+            scpTransferDialog = null
+            dialog.dismiss()
+            if (error == null) {
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_upload_done, displayName),
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_upload_failed, error.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        dialog.setButton(
+            DialogInterface.BUTTON_NEGATIVE,
+            getString(android.R.string.cancel),
+        ) { _, _ ->
+            cancelled.set(true)
+            scpTransferDialog = null
+            future?.cancel(true)
+            Toast.makeText(this, R.string.scp_upload_cancelled, Toast.LENGTH_SHORT).show()
+        }
+        scpTransferDialog = dialog
+        dialog.show()
+    }
+
+    private fun queryDisplayName(uri: Uri): String? =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+
+    /** A non-cancelable-by-back, indeterminate progress dialog for an SCP transfer. */
+    private fun buildScpProgressDialog(titleRes: Int): AlertDialog {
+        val padding = dpToPx(24)
+        val progressView = ProgressBar(this).apply { isIndeterminate = true }
+        val container = FrameLayout(this).apply {
+            setPadding(padding, padding, padding, padding)
+            addView(
+                progressView,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.CENTER,
+                ),
+            )
+        }
+        return AlertDialog.Builder(this)
+            .setTitle(titleRes)
+            .setView(container)
+            .setCancelable(false)
+            .create()
     }
 
     private fun auxButtonLayoutParams(): LinearLayout.LayoutParams {
@@ -1743,6 +2041,10 @@ class TerminalActivity : AppCompatActivity() {
     override fun onDestroy() {
         uploadDialog?.dismiss()
         uploadDialog = null
+        scpBrowserDialog?.dismiss()
+        scpBrowserDialog = null
+        scpTransferDialog?.dismiss()
+        scpTransferDialog = null
         pendingTitleHandler.removeCallbacks(pendingTitleRunnable)
         if (bound) {
             service?.detachOutputListener()

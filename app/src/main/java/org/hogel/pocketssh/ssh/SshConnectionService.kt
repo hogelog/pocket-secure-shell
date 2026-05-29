@@ -392,6 +392,65 @@ class SshConnectionService : Service() {
         }
     }
 
+    /**
+     * List remote directory [path] via SFTP for the file browser. [onResult] is
+     * invoked on the main thread with the resolved absolute path and entries on
+     * success, or the thrown error on failure. Runs on the same single-threaded
+     * [scpExecutor] as uploads/downloads, so it serializes with an in-flight
+     * transfer (acceptable: the browser is modal during a transfer).
+     */
+    fun listRemoteDir(path: String, onResult: (Result<RemoteListing>) -> Unit) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(Result.failure(IllegalStateException("Not connected"))) }
+            return
+        }
+        scpExecutor.submit {
+            val result = try {
+                val resolved = ssh.canonicalPath(path)
+                Result.success(RemoteListing(resolved, ssh.listDir(resolved)))
+            } catch (e: Throwable) {
+                // Do NOT log [path]: a remote path is user-controlled target data.
+                Log.e(TAG, "SFTP list failed")
+                Result.failure(e)
+            }
+            mainHandler.post { onResult(result) }
+        }
+    }
+
+    /**
+     * Download remote file [remotePath] via SFTP into [out], reporting `null` on
+     * success or the thrown error on failure on the main thread. Returns a
+     * [Future] the caller can `cancel(true)` to interrupt a stuck download. The
+     * caller owns [out] and must close it after [onResult] fires. Returns `null`
+     * if not connected (in which case [onResult] is still posted).
+     */
+    fun downloadFile(
+        remotePath: String,
+        out: java.io.OutputStream,
+        onResult: (Throwable?) -> Unit,
+    ): Future<*>? {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(IllegalStateException("Not connected")) }
+            return null
+        }
+        return scpExecutor.submit {
+            val error = try {
+                ssh.downloadFile(remotePath, out)
+                null
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return@submit
+            } catch (e: Throwable) {
+                if (Thread.currentThread().isInterrupted) return@submit
+                Log.e(TAG, "SFTP download failed")
+                e
+            }
+            mainHandler.post { onResult(error) }
+        }
+    }
+
     fun resizeWindow(columns: Int, rows: Int) {
         // resize sends a packet, so it must not run on the main thread.
         runCatching {
