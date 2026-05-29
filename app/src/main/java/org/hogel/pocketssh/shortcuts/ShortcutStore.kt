@@ -67,7 +67,7 @@ class ShortcutStore(context: Context) {
                     Shortcut("⌨️", "{CTRL-INPUT}"), // control-input dialog (^C/^D/^L/^R/…)
                     Shortcut("\uD83D\uDDBC", "{IMAGE-PASTE}"), // 🖼 image picker
                     Shortcut("\uD83D\uDCCB", "{COPY}"),        // 📋 selection mode
-                    Shortcut("\uD83D\uDCE5", "{PASTE}"),       // 📥 paste clipboard
+                    Shortcut("\uD83D\uDCC1", "{SCP}"),         // 📁 remote file browser
                 ),
             ),
             // Swipe direction mirrors the FAB arrows: ⬅️ / swipe-left =

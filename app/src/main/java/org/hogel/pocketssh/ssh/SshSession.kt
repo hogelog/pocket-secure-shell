@@ -3,12 +3,19 @@ package org.hogel.pocketssh.ssh
 import com.trilead.ssh2.ChannelCondition
 import com.trilead.ssh2.Connection
 import com.trilead.ssh2.SCPClient
+import com.trilead.ssh2.SFTPv3Client
 import com.trilead.ssh2.ServerHostKeyVerifier
 import com.trilead.ssh2.Session
 import com.trilead.ssh2.auth.SignatureProxy
 import java.io.InputStream
 import java.io.OutputStream
 import org.hogel.pocketssh.tmux.TmuxTitle
+
+/** One entry in a remote directory listing. */
+data class RemoteEntry(val name: String, val isDirectory: Boolean, val size: Long)
+
+/** A resolved remote directory ([path] is absolute/canonical) and its entries. */
+data class RemoteListing(val path: String, val entries: List<RemoteEntry>)
 
 /** SSH connection backed by sshlib (Trilead SSH2). */
 class SshSession(
@@ -119,6 +126,74 @@ class SshSession(
     fun uploadBytes(bytes: ByteArray, filename: String, remoteDir: String) {
         val conn = connection ?: throw IllegalStateException("Not connected")
         SCPClient(conn).put(bytes, filename, remoteDir)
+    }
+
+    /**
+     * Resolve [path] to an absolute canonical path on the remote (expands a
+     * relative path or a bare `.` against the SFTP start directory, which is
+     * the login home). Blocking; call from a background thread.
+     */
+    fun canonicalPath(path: String): String {
+        val conn = connection ?: throw IllegalStateException("Not connected")
+        val sftp = SFTPv3Client(conn)
+        try {
+            return sftp.canonicalPath(path)
+        } finally {
+            sftp.close()
+        }
+    }
+
+    /**
+     * List the entries of remote directory [path] via SFTP, sorted directories
+     * first then by name. The `.` self-entry is dropped; `..` is kept so the
+     * caller can offer an "up" navigation. Opens its own SFTP channel over the
+     * existing [Connection] and closes it before returning, so it does not
+     * interfere with the interactive shell. Blocking; call from a background
+     * thread.
+     */
+    fun listDir(path: String): List<RemoteEntry> {
+        val conn = connection ?: throw IllegalStateException("Not connected")
+        val sftp = SFTPv3Client(conn)
+        try {
+            return sftp.ls(path)
+                .filter { it.filename != "." }
+                .map { RemoteEntry(it.filename, it.attributes.isDirectory, it.attributes.size ?: 0L) }
+                .sortedWith(compareByDescending<RemoteEntry> { it.isDirectory }.thenBy { it.name })
+        } finally {
+            sftp.close()
+        }
+    }
+
+    /**
+     * Download remote file [remotePath] via SFTP, streaming its bytes into
+     * [out]. Reads in chunks so a large file does not have to fit in memory.
+     * Honors thread interruption (the caller's [java.util.concurrent.Future]
+     * cancel) between chunks so a stuck download can be abandoned without
+     * tearing down the SSH connection. The caller owns [out] and must close it.
+     * Blocking; call from a background thread.
+     */
+    fun downloadFile(remotePath: String, out: OutputStream) {
+        val conn = connection ?: throw IllegalStateException("Not connected")
+        val sftp = SFTPv3Client(conn)
+        try {
+            val handle = sftp.openFileRO(remotePath)
+            try {
+                val buf = ByteArray(32 * 1024)
+                var offset = 0L
+                while (true) {
+                    if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                    val read = sftp.read(handle, offset, buf, 0, buf.size)
+                    if (read <= 0) break
+                    out.write(buf, 0, read)
+                    offset += read
+                }
+                out.flush()
+            } finally {
+                sftp.closeFile(handle)
+            }
+        } finally {
+            sftp.close()
+        }
     }
 
     /**
