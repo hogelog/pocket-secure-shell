@@ -1,3 +1,3 @@
-- The floating action button now gives you paste, Ctrl-C, Ctrl-D and a configurable lock toggle
-- While you hold a floating-button action, it shows in a center overlay; slide off to cancel
-- Ctrl-C / Ctrl-D moved from the always-on shortcut bar to the floating button
+- Browse remote files over SFTP: download to your device, copy a file's contents to the clipboard, or upload local files.
+- New control-input dialog for sending arbitrary Ctrl-key combinations.
+- ^C is now always available in the shortcut bar.
