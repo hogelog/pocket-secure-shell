@@ -1121,7 +1121,7 @@ class TerminalActivity : AppCompatActivity() {
                 onClick.add { scpNavigate(target) }
             } else {
                 labels.add("📄  ${entry.name}")
-                onClick.add { confirmScpDownload(target, entry.name) }
+                onClick.add { showScpFileActions(target, entry.name) }
             }
         }
         val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
@@ -1184,6 +1184,24 @@ class TerminalActivity : AppCompatActivity() {
     private fun joinRemotePath(dir: String, name: String): String =
         if (dir.endsWith("/")) "$dir$name" else "$dir/$name"
 
+    /** Offer Download (save to Downloads) or Copy (file contents to clipboard). */
+    private fun showScpFileActions(remotePath: String, displayName: String) {
+        val items = arrayOf(
+            getString(R.string.scp_file_action_download),
+            getString(R.string.scp_file_action_copy),
+        )
+        AlertDialog.Builder(this)
+            .setTitle(displayName)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> confirmScpDownload(remotePath, displayName)
+                    1 -> startScpCopyToClipboard(remotePath, displayName)
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
     private fun confirmScpDownload(remotePath: String, displayName: String) {
         AlertDialog.Builder(this)
             .setTitle(R.string.scp_download_confirm_title)
@@ -1191,6 +1209,54 @@ class TerminalActivity : AppCompatActivity() {
             .setPositiveButton(android.R.string.ok) { _, _ -> startScpDownload(remotePath, displayName) }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
+    }
+
+    /**
+     * Download [remotePath] into memory and put its contents on the clipboard as
+     * UTF-8 text. A cancelable progress dialog blocks until the SFTP worker
+     * finishes; canceling interrupts the worker.
+     */
+    private fun startScpCopyToClipboard(remotePath: String, displayName: String) {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val out = java.io.ByteArrayOutputStream()
+        val cancelled = AtomicBoolean(false)
+        val dialog = buildScpProgressDialog(R.string.scp_copying)
+        val future = svc.downloadFile(remotePath, out) { error ->
+            if (cancelled.get()) return@downloadFile
+            scpTransferDialog = null
+            dialog.dismiss()
+            if (error == null) {
+                val text = out.toString(Charsets.UTF_8.name())
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText(displayName, text))
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_copy_done, displayName),
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_copy_failed, error.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        dialog.setButton(
+            DialogInterface.BUTTON_NEGATIVE,
+            getString(android.R.string.cancel),
+        ) { _, _ ->
+            cancelled.set(true)
+            scpTransferDialog = null
+            future?.cancel(true)
+            Toast.makeText(this, R.string.scp_copy_cancelled, Toast.LENGTH_SHORT).show()
+        }
+        scpTransferDialog = dialog
+        dialog.show()
     }
 
     /**
