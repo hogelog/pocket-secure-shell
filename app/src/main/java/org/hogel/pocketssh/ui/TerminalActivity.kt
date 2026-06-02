@@ -233,10 +233,6 @@ class TerminalActivity : AppCompatActivity() {
     // buffer from growing without bound across the session.
     private val recentOutputTail = java.io.ByteArrayOutputStream()
 
-    // Active image-upload progress dialog, or null when no upload is in
-    // flight. Held so onDestroy can dismiss it to avoid a window leak when
-    // the activity tears down mid-upload.
-    private var uploadDialog: AlertDialog? = null
 
     // Active SCP file-browser and transfer-progress dialogs, plus the directory
     // a pending upload targets. Held so onDestroy can dismiss any open window
@@ -981,10 +977,9 @@ class TerminalActivity : AppCompatActivity() {
      * type its `/tmp/...` path into the SSH stdin so the user can submit
      * it to Claude Code by pressing Enter.
      *
-     * A non-cancelable progress dialog blocks the UI for the duration so a
-     * second pick can't kick off a concurrent upload; the Cancel button
-     * interrupts the upload worker so a hung network upload can be abandoned
-     * without disconnecting the whole SSH session.
+     * The transfer runs in the background (progress/result surface through the
+     * service notification) so the terminal stays usable; the path is typed
+     * on success only if this activity is still around to receive the result.
      */
     private fun onImagePicked(uri: Uri) {
         val svc = service
@@ -1000,61 +995,17 @@ class TerminalActivity : AppCompatActivity() {
         }.format(Date())
         val filename = "pocketssh-$timestamp.$ext"
 
-        val cancelled = AtomicBoolean(false)
-        val padding = dpToPx(24)
-        val progressView = ProgressBar(this).apply { isIndeterminate = true }
-        val container = FrameLayout(this).apply {
-            setPadding(padding, padding, padding, padding)
-            addView(
-                progressView,
-                FrameLayout.LayoutParams(
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    FrameLayout.LayoutParams.WRAP_CONTENT,
-                    Gravity.CENTER,
-                ),
-            )
-        }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.image_upload_in_progress)
-            .setView(container)
-            .setCancelable(false)
-            .create()
-
-        val uploadFuture = svc.uploadFile(
+        svc.uploadFile(
             { resolver.openInputStream(uri) ?: throw IOException("Cannot open picked image") },
             filename,
             REMOTE_TMP_DIR,
+            queryFileSize(uri),
         ) { error ->
-            if (cancelled.get()) return@uploadFile
-            uploadDialog = null
             if (error == null) {
-                // Kick off the SSH write before dismiss() so the SSH round-trip
-                // overlaps the dialog's exit animation; otherwise the path
-                // appears noticeably after the dialog disappears.
                 val pathRef = "$REMOTE_TMP_DIR/$filename "
                 writeToSsh(pathRef.toByteArray(Charsets.UTF_8))
             }
-            dialog.dismiss()
-            if (error != null) {
-                Toast.makeText(
-                    this,
-                    getString(R.string.image_upload_failed, error.message ?: ""),
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
         }
-
-        dialog.setButton(
-            DialogInterface.BUTTON_NEGATIVE,
-            getString(R.string.image_upload_cancel),
-        ) { _, _ ->
-            cancelled.set(true)
-            uploadDialog = null
-            uploadFuture?.cancel(true)
-            Toast.makeText(this, R.string.image_upload_cancelled, Toast.LENGTH_SHORT).show()
-        }
-        uploadDialog = dialog
-        dialog.show()
     }
 
     private fun extensionForMime(mime: String): String = when (mime.lowercase()) {
@@ -1338,48 +1289,26 @@ class TerminalActivity : AppCompatActivity() {
             return
         }
         val displayName = queryDisplayName(uri) ?: "upload.bin"
-
-        val cancelled = AtomicBoolean(false)
-        val dialog = buildScpProgressDialog(R.string.scp_uploading)
-        val future = svc.uploadFile(
+        // Runs in the background; progress and result surface through the
+        // service notification, so the terminal stays usable during the upload.
+        svc.uploadFile(
             { contentResolver.openInputStream(uri) ?: throw IOException("Cannot open picked file") },
             displayName,
             remoteDir,
-        ) { error ->
-            if (cancelled.get()) return@uploadFile
-            scpTransferDialog = null
-            dialog.dismiss()
-            if (error == null) {
-                Toast.makeText(
-                    this,
-                    getString(R.string.scp_upload_done, displayName),
-                    Toast.LENGTH_LONG,
-                ).show()
-            } else {
-                Toast.makeText(
-                    this,
-                    getString(R.string.scp_upload_failed, error.message ?: ""),
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        }
-        dialog.setButton(
-            DialogInterface.BUTTON_NEGATIVE,
-            getString(android.R.string.cancel),
-        ) { _, _ ->
-            cancelled.set(true)
-            scpTransferDialog = null
-            future?.cancel(true)
-            Toast.makeText(this, R.string.scp_upload_cancelled, Toast.LENGTH_SHORT).show()
-        }
-        scpTransferDialog = dialog
-        dialog.show()
+            queryFileSize(uri),
+        ) {}
     }
 
     private fun queryDisplayName(uri: Uri): String? =
         contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
             if (c.moveToFirst()) c.getString(0) else null
         }
+
+    /** Picked-file size in bytes for the upload progress bar, or -1 if unknown. */
+    private fun queryFileSize(uri: Uri): Long =
+        contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
+        } ?: -1L
 
     /** A non-cancelable-by-back, indeterminate progress dialog for an SCP transfer. */
     private fun buildScpProgressDialog(titleRes: Int): AlertDialog {
@@ -2094,8 +2023,6 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        uploadDialog?.dismiss()
-        uploadDialog = null
         scpBrowserDialog?.dismiss()
         scpBrowserDialog = null
         scpTransferDialog?.dismiss()
