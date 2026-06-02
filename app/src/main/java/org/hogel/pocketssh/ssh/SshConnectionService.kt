@@ -357,16 +357,18 @@ class SshConnectionService : Service() {
     }
 
     /**
-     * Upload [bytes] to the remote host as [remoteDir]/[filename] via SCP.
-     * [onResult] is invoked on the main thread with `null` on success or the
-     * thrown error on failure. Returns a [Future] the caller can `cancel(true)`
-     * to interrupt the upload thread; the SCP socket I/O unblocks with
-     * `InterruptedIOException`, so a stuck upload can be aborted without
-     * tearing down the whole SSH connection. Returns `null` if the service is
-     * not connected (in which case [onResult] is still posted asynchronously).
+     * Upload to the remote host as [remoteDir]/[filename] via SFTP, streaming
+     * the bytes from the stream returned by [openInput] (invoked on the upload
+     * thread, so opening a large source does not block the UI). [onResult] is
+     * invoked on the main thread with `null` on success or the thrown error on
+     * failure. Returns a [Future] the caller can `cancel(true)` to interrupt
+     * the upload thread; the SFTP I/O unblocks so a stuck upload can be aborted
+     * without tearing down the whole SSH connection. Returns `null` if the
+     * service is not connected (in which case [onResult] is still posted
+     * asynchronously).
      */
-    fun uploadBytes(
-        bytes: ByteArray,
+    fun uploadFile(
+        openInput: () -> java.io.InputStream,
         filename: String,
         remoteDir: String,
         onResult: (Throwable?) -> Unit,
@@ -378,14 +380,14 @@ class SshConnectionService : Service() {
         }
         return scpExecutor.submit {
             val error = try {
-                ssh.uploadBytes(bytes, filename, remoteDir)
+                ssh.uploadFile(openInput(), filename, remoteDir)
                 null
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return@submit
             } catch (e: Throwable) {
                 if (Thread.currentThread().isInterrupted) return@submit
-                Log.e(TAG, "SCP upload failed", e)
+                Log.e(TAG, "SFTP upload failed", e)
                 e
             }
             mainHandler.post { onResult(error) }

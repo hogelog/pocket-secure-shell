@@ -58,7 +58,6 @@
     <string name="image_upload_cancel">Cancel</string>
     <string name="image_upload_cancelled">Image upload cancelled</string>
     <string name="image_upload_failed">Image upload failed: %1$s</string>
-    <string name="image_upload_read_failed">Failed to read image</string>
     <string name="image_upload_not_connected">Not connected</string>
     <string name="scp_browser_title">Remote files</string>
     <string name="scp_upload_here">Upload here</string>
@@ -80,7 +79,6 @@
     <string name="scp_upload_done">Uploaded %1$s</string>
     <string name="scp_upload_failed">Upload failed: %1$s</string>
     <string name="scp_upload_cancelled">Upload cancelled</string>
-    <string name="scp_upload_read_failed">Failed to read file</string>
     <string name="ctrl_input_title">Control input</string>
     <string name="ctrl_input_prefix">Ctrl +</string>
     <string name="ctrl_input_hint">key</string>

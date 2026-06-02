@@ -2,7 +2,6 @@ package org.hogel.pocketssh.ssh
 
 import com.trilead.ssh2.ChannelCondition
 import com.trilead.ssh2.Connection
-import com.trilead.ssh2.SCPClient
 import com.trilead.ssh2.SFTPv3Client
 import com.trilead.ssh2.ServerHostKeyVerifier
 import com.trilead.ssh2.Session
@@ -118,14 +117,39 @@ class SshSession(
     }
 
     /**
-     * Upload [bytes] to [remoteDir] on the remote host as [filename] via SCP.
-     * Opens its own SSH session over the existing [Connection], so it does
-     * not interfere with the interactive shell session. Blocking; call from
-     * a background thread.
+     * Upload [input] to the remote host as [remoteDir]/[filename] via SFTP,
+     * streaming in chunks so a large file does not have to fit in memory.
+     * Truncates any existing file at the target path (SCP-like overwrite).
+     * Honors thread interruption (the caller's [java.util.concurrent.Future]
+     * cancel) between chunks so a stuck upload can be abandoned without
+     * tearing down the SSH connection. Closes [input]. Opens its own SFTP
+     * channel over the existing [Connection], so it does not interfere with
+     * the interactive shell. Blocking; call from a background thread.
      */
-    fun uploadBytes(bytes: ByteArray, filename: String, remoteDir: String) {
+    fun uploadFile(input: InputStream, filename: String, remoteDir: String) {
         val conn = connection ?: throw IllegalStateException("Not connected")
-        SCPClient(conn).put(bytes, filename, remoteDir)
+        val remotePath = if (remoteDir.endsWith("/")) "$remoteDir$filename" else "$remoteDir/$filename"
+        val sftp = SFTPv3Client(conn)
+        try {
+            val handle = sftp.createFileTruncate(remotePath)
+            try {
+                input.use {
+                    val buf = ByteArray(32 * 1024)
+                    var offset = 0L
+                    while (true) {
+                        if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                        val read = it.read(buf)
+                        if (read <= 0) break
+                        sftp.write(handle, offset, buf, 0, read)
+                        offset += read
+                    }
+                }
+            } finally {
+                sftp.closeFile(handle)
+            }
+        } finally {
+            sftp.close()
+        }
     }
 
     /**

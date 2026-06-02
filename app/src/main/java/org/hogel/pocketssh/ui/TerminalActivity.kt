@@ -49,6 +49,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -976,13 +977,13 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Upload the picked image to the remote host via SCP and, on success,
+     * Upload the picked image to the remote host via SFTP and, on success,
      * type its `/tmp/...` path into the SSH stdin so the user can submit
      * it to Claude Code by pressing Enter.
      *
      * A non-cancelable progress dialog blocks the UI for the duration so a
      * second pick can't kick off a concurrent upload; the Cancel button
-     * interrupts the SCP worker so a hung network upload can be abandoned
+     * interrupts the upload worker so a hung network upload can be abandoned
      * without disconnecting the whole SSH session.
      */
     private fun onImagePicked(uri: Uri) {
@@ -998,16 +999,6 @@ class TerminalActivity : AppCompatActivity() {
             timeZone = TimeZone.getTimeZone("Asia/Tokyo")
         }.format(Date())
         val filename = "pocketssh-$timestamp.$ext"
-        val bytes = try {
-            resolver.openInputStream(uri)?.use { it.readBytes() }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to read picked image", e)
-            null
-        }
-        if (bytes == null) {
-            Toast.makeText(this, R.string.image_upload_read_failed, Toast.LENGTH_SHORT).show()
-            return
-        }
 
         val cancelled = AtomicBoolean(false)
         val padding = dpToPx(24)
@@ -1029,8 +1020,12 @@ class TerminalActivity : AppCompatActivity() {
             .setCancelable(false)
             .create()
 
-        val uploadFuture = svc.uploadBytes(bytes, filename, REMOTE_TMP_DIR) { error ->
-            if (cancelled.get()) return@uploadBytes
+        val uploadFuture = svc.uploadFile(
+            { resolver.openInputStream(uri) ?: throw IOException("Cannot open picked image") },
+            filename,
+            REMOTE_TMP_DIR,
+        ) { error ->
+            if (cancelled.get()) return@uploadFile
             uploadDialog = null
             if (error == null) {
                 // Kick off the SSH write before dismiss() so the SSH round-trip
@@ -1343,21 +1338,15 @@ class TerminalActivity : AppCompatActivity() {
             return
         }
         val displayName = queryDisplayName(uri) ?: "upload.bin"
-        val bytes = try {
-            contentResolver.openInputStream(uri)?.use { it.readBytes() }
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to read picked file", e)
-            null
-        }
-        if (bytes == null) {
-            Toast.makeText(this, R.string.scp_upload_read_failed, Toast.LENGTH_SHORT).show()
-            return
-        }
 
         val cancelled = AtomicBoolean(false)
         val dialog = buildScpProgressDialog(R.string.scp_uploading)
-        val future = svc.uploadBytes(bytes, displayName, remoteDir) { error ->
-            if (cancelled.get()) return@uploadBytes
+        val future = svc.uploadFile(
+            { contentResolver.openInputStream(uri) ?: throw IOException("Cannot open picked file") },
+            displayName,
+            remoteDir,
+        ) { error ->
+            if (cancelled.get()) return@uploadFile
             scpTransferDialog = null
             dialog.dismiss()
             if (error == null) {
