@@ -124,9 +124,20 @@ class SshSession(
      * cancel) between chunks so a stuck upload can be abandoned without
      * tearing down the SSH connection. Closes [input]. Opens its own SFTP
      * channel over the existing [Connection], so it does not interfere with
-     * the interactive shell. Blocking; call from a background thread.
+     * the interactive shell. [onProgress] is invoked after each chunk with the
+     * cumulative bytes written. Blocking; call from a background thread.
+     *
+     * Each [SFTPv3Client.write] blocks for the server's ack, so throughput is
+     * round-trip-bound; the chunk size is the only knob. [UPLOAD_CHUNK_BYTES]
+     * is kept well under OpenSSH's 256 KiB SFTP message limit while cutting the
+     * round-trip count far below a conservative 32 KiB chunk.
      */
-    fun uploadFile(input: InputStream, filename: String, remoteDir: String) {
+    fun uploadFile(
+        input: InputStream,
+        filename: String,
+        remoteDir: String,
+        onProgress: (Long) -> Unit = {},
+    ) {
         val conn = connection ?: throw IllegalStateException("Not connected")
         val remotePath = if (remoteDir.endsWith("/")) "$remoteDir$filename" else "$remoteDir/$filename"
         val sftp = SFTPv3Client(conn)
@@ -134,7 +145,7 @@ class SshSession(
             val handle = sftp.createFileTruncate(remotePath)
             try {
                 input.use {
-                    val buf = ByteArray(32 * 1024)
+                    val buf = ByteArray(UPLOAD_CHUNK_BYTES)
                     var offset = 0L
                     while (true) {
                         if (Thread.currentThread().isInterrupted) throw InterruptedException()
@@ -142,6 +153,7 @@ class SshSession(
                         if (read <= 0) break
                         sftp.write(handle, offset, buf, 0, read)
                         offset += read
+                        onProgress(offset)
                     }
                 }
             } finally {
@@ -278,6 +290,7 @@ class SshSession(
     companion object {
         private const val TAG = "SshSession"
         private const val TMUX_SESSION_NAME = "pocketssh"
+        private const val UPLOAD_CHUNK_BYTES = 128 * 1024
     }
 }
 
