@@ -1898,13 +1898,17 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Map a tap on the terminal to a URL, if the tapped word resolves to one.
+     * Map a tap on the terminal to a URL, if one sits at or near the tap.
      * Returns true (and shows the confirm dialog) when a URL is found, in
      * which case the caller should suppress the default tap behaviour.
      *
+     * The whole wrapped line is scanned (not just the tapped word), so a tap
+     * landing on prose next to a link still opens it, and the tapped row plus
+     * the rows just above and below are checked so a slightly-off tap counts.
+     *
      * Bounded to the visible screen rows so that scrollback (`mTopRow < 0`)
-     * is not handled — `TerminalBuffer.getWordAtLocation` only walks
-     * line-wrap continuations in the screen range, not the transcript.
+     * is not handled — the wrapped-line walk only follows line-wrap
+     * continuations in the screen range, not the transcript.
      */
     private fun tryOpenLinkAt(event: MotionEvent): Boolean {
         val terminalView = binding.terminalView
@@ -1912,13 +1916,44 @@ class TerminalActivity : AppCompatActivity() {
         val coords = terminalView.getColumnAndRow(event, true)
         val column = coords[0]
         val row = coords[1]
-        if (row < 0 || row >= emulator.mRows) return false
         if (column < 0 || column >= emulator.mColumns) return false
-        val word = emulator.screen.getWordAtLocation(column, row)
-        if (word.isNullOrBlank()) return false
-        val url = LinkDetector.extractUrls(word).firstOrNull() ?: return false
-        showOpenLinkConfirmDialog(url)
-        return true
+        for (candidate in intArrayOf(row, row - 1, row + 1)) {
+            if (candidate < 0 || candidate >= emulator.mRows) continue
+            val url = findUrlNearTap(emulator, column, candidate) ?: continue
+            showOpenLinkConfirmDialog(url)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Scan the whole wrapped line that `row` belongs to and return the URL
+     * nearest the tapped column, or null if the line holds none.
+     *
+     * The wrap walk and offset arithmetic mirror
+     * `TerminalBuffer.getWordAtLocation`: rows before the last one in a wrapped
+     * line are full-width, so the flat text offset of the tap is
+     * `(row - y1) * columns + column`.
+     */
+    private fun findUrlNearTap(emulator: TerminalEmulator, column: Int, row: Int): String? {
+        val screen = emulator.screen
+        val cols = emulator.mColumns
+        val rows = emulator.mRows
+        var y1 = row
+        var y2 = row
+        while (y1 > 0 && !screen.getSelectedText(0, y1 - 1, cols, row, true, true).contains('\n')) y1--
+        while (y2 < rows && !screen.getSelectedText(0, row, cols, y2 + 1, true, true).contains('\n')) y2++
+        val text = screen.getSelectedText(0, y1, cols, y2, true, true)
+        val matches = LinkDetector.extractUrlMatches(text)
+        if (matches.isEmpty()) return null
+        val tapOffset = (row - y1) * cols + column
+        return matches.minByOrNull { match ->
+            when {
+                tapOffset < match.start -> match.start - tapOffset
+                tapOffset >= match.endExclusive -> tapOffset - match.endExclusive + 1
+                else -> 0
+            }
+        }?.url
     }
 
     private fun showOpenLinkConfirmDialog(url: String) {
