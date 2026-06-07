@@ -1904,7 +1904,7 @@ class TerminalActivity : AppCompatActivity() {
      *
      * The whole wrapped line is scanned (not just the tapped word), so a tap
      * landing on prose next to a link still opens it, and the tapped row plus
-     * the rows just above and below are checked so a slightly-off tap counts.
+     * the two rows above and below are checked so a slightly-off tap counts.
      *
      * Bounded to the visible screen rows so that scrollback (`mTopRow < 0`)
      * is not handled — the wrapped-line walk only follows line-wrap
@@ -1917,7 +1917,7 @@ class TerminalActivity : AppCompatActivity() {
         val column = coords[0]
         val row = coords[1]
         if (column < 0 || column >= emulator.mColumns) return false
-        for (candidate in intArrayOf(row, row - 1, row + 1)) {
+        for (candidate in intArrayOf(row, row - 1, row + 1, row - 2, row + 2)) {
             if (candidate < 0 || candidate >= emulator.mRows) continue
             val url = findUrlNearTap(emulator, column, candidate) ?: continue
             showOpenLinkConfirmDialog(url)
