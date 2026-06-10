@@ -97,4 +97,24 @@ class LinkDetectorTest {
             LinkDetector.extractUrls("\"https://example.com\""),
         )
     }
+
+    @Test
+    fun `reports the span of each match`() {
+        val text = "see https://a.example then http://b.example/x."
+        assertEquals(
+            listOf(
+                LinkDetector.UrlMatch("https://a.example", 4, 21),
+                LinkDetector.UrlMatch("http://b.example/x", 27, 45),
+            ),
+            LinkDetector.extractUrlMatches(text),
+        )
+    }
+
+    @Test
+    fun `span end excludes trimmed trailing punctuation`() {
+        val match = LinkDetector.extractUrlMatches("visit https://example.com/path.").single()
+        assertEquals("https://example.com/path", match.url)
+        assertEquals(6, match.start)
+        assertEquals("https://example.com/path".length + 6, match.endExclusive)
+    }
 }
