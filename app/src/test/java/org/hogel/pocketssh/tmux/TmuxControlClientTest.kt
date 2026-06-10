@@ -174,6 +174,23 @@ class TmuxControlClientTest {
     }
 
     @Test
+    fun `capture reply keeps raw SGR escape bytes byte-exact`() {
+        // Real tmux 3.5a wire shape: unlike %output, the reply body is NOT
+        // octal-escaped — colour escapes arrive as raw ESC bytes and must
+        // reach the emulator unchanged for the seeded history to keep colour.
+        client.requestCapture("%0")
+        feed("%begin 1781127830 284 1\r\n")
+        feed("\u001B[31mRED\u001B[39m plain \u001B[1m\u001B[34mBOLDBLUE\r\n")
+        feed("\u001B[0mline2 \u001B[42mGREENBG\r\n")
+        feed("%end 1781127830 284 1\r\n")
+        assertArrayEquals(
+            ("\u001B[31mRED\u001B[39m plain \u001B[1m\u001B[34mBOLDBLUE\r\n" +
+                "\u001B[0mline2 \u001B[42mGREENBG").toByteArray(Charsets.ISO_8859_1),
+            captures.single().second,
+        )
+    }
+
+    @Test
     fun `a body line that looks like a terminator does not close on a mismatched number`() {
         client.requestCapture("%0")
         feed("%begin 1 7 0\n")
