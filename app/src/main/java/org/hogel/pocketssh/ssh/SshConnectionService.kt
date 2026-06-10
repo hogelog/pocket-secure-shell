@@ -153,6 +153,11 @@ class SshConnectionService : Service() {
         Thread(r, "ssh-scp").apply { isDaemon = true }
     }
 
+    // The in-flight upload, so its notification's cancel action can interrupt
+    // it without tearing down the SSH connection.
+    @Volatile
+    private var uploadFuture: Future<*>? = null
+
     private val keepaliveExecutor = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "ssh-keepalive").apply { isDaemon = true }
     }
@@ -169,6 +174,10 @@ class SshConnectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             shutdown()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_CANCEL_UPLOAD) {
+            cancelUpload()
             return START_NOT_STICKY
         }
         ServiceCompat.startForeground(
@@ -524,18 +533,104 @@ class SshConnectionService : Service() {
     }
 
     /**
-     * Upload [bytes] to the remote host as [remoteDir]/[filename] via SCP.
-     * [onResult] is invoked on the main thread with `null` on success or the
-     * thrown error on failure. Returns a [Future] the caller can `cancel(true)`
-     * to interrupt the upload thread; the SCP socket I/O unblocks with
-     * `InterruptedIOException`, so a stuck upload can be aborted without
-     * tearing down the whole SSH connection. Returns `null` if the service is
-     * not connected (in which case [onResult] is still posted asynchronously).
+     * Stream-upload to [remoteDir]/[filename] over SFTP in the background,
+     * surfacing progress, success, and failure through a dedicated
+     * notification so the terminal stays usable for the duration. The stream
+     * is opened by [openInput] on the upload thread (so opening a large source
+     * does not block the UI); [totalBytes] (<= 0 if unknown) drives the
+     * progress bar. The transfer can be cancelled from its notification action
+     * ([ACTION_CANCEL_UPLOAD]). [onResult] is posted on the main thread for the
+     * caller to run any in-app follow-up (`null` = success); UI feedback itself
+     * is the notification's job. Posts a not-connected error and returns
+     * without starting if there is no live session.
      */
-    fun uploadBytes(
-        bytes: ByteArray,
+    fun uploadFile(
+        openInput: () -> java.io.InputStream,
         filename: String,
         remoteDir: String,
+        totalBytes: Long,
+        onResult: (Throwable?) -> Unit,
+    ) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(IllegalStateException("Not connected")) }
+            return
+        }
+        showUploadProgress(filename, 0, totalBytes)
+        uploadFuture = scpExecutor.submit {
+            var lastPct = -1
+            val error = try {
+                ssh.uploadFile(openInput(), filename, remoteDir) { sent ->
+                    if (totalBytes > 0) {
+                        val pct = ((sent * 100) / totalBytes).toInt().coerceIn(0, 100)
+                        if (pct != lastPct) {
+                            lastPct = pct
+                            showUploadProgress(filename, pct, totalBytes)
+                        }
+                    }
+                }
+                null
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                cancelUploadNotification()
+                return@submit
+            } catch (e: Throwable) {
+                if (Thread.currentThread().isInterrupted) {
+                    cancelUploadNotification()
+                    return@submit
+                }
+                Log.e(TAG, "SFTP upload failed", e)
+                e
+            }
+            uploadFuture = null
+            showUploadDone(filename, error)
+            mainHandler.post { onResult(error) }
+        }
+    }
+
+    /** Cancel the in-flight upload (if any) and clear its notification. */
+    private fun cancelUpload() {
+        uploadFuture?.cancel(true)
+        uploadFuture = null
+        cancelUploadNotification()
+    }
+
+    /**
+     * List remote directory [path] via SFTP for the file browser. [onResult] is
+     * invoked on the main thread with the resolved absolute path and entries on
+     * success, or the thrown error on failure. Runs on the same single-threaded
+     * [scpExecutor] as uploads/downloads, so it serializes with an in-flight
+     * transfer (acceptable: the browser is modal during a transfer).
+     */
+    fun listRemoteDir(path: String, onResult: (Result<RemoteListing>) -> Unit) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(Result.failure(IllegalStateException("Not connected"))) }
+            return
+        }
+        scpExecutor.submit {
+            val result = try {
+                val resolved = ssh.canonicalPath(path)
+                Result.success(RemoteListing(resolved, ssh.listDir(resolved)))
+            } catch (e: Throwable) {
+                // Do NOT log [path]: a remote path is user-controlled target data.
+                Log.e(TAG, "SFTP list failed")
+                Result.failure(e)
+            }
+            mainHandler.post { onResult(result) }
+        }
+    }
+
+    /**
+     * Download remote file [remotePath] via SFTP into [out], reporting `null` on
+     * success or the thrown error on failure on the main thread. Returns a
+     * [Future] the caller can `cancel(true)` to interrupt a stuck download. The
+     * caller owns [out] and must close it after [onResult] fires. Returns `null`
+     * if not connected (in which case [onResult] is still posted).
+     */
+    fun downloadFile(
+        remotePath: String,
+        out: java.io.OutputStream,
         onResult: (Throwable?) -> Unit,
     ): Future<*>? {
         val ssh = session
@@ -545,14 +640,14 @@ class SshConnectionService : Service() {
         }
         return scpExecutor.submit {
             val error = try {
-                ssh.uploadBytes(bytes, filename, remoteDir)
+                ssh.downloadFile(remotePath, out)
                 null
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return@submit
             } catch (e: Throwable) {
                 if (Thread.currentThread().isInterrupted) return@submit
-                Log.e(TAG, "SCP upload failed", e)
+                Log.e(TAG, "SFTP download failed")
                 e
             }
             mainHandler.post { onResult(error) }
@@ -714,6 +809,51 @@ class SshConnectionService : Service() {
             .notify(NOTIFICATION_ID, buildNotification(text))
     }
 
+    private fun showUploadProgress(name: String, pct: Int, totalBytes: Long) {
+        val cancelIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, SshConnectionService::class.java).setAction(ACTION_CANCEL_UPLOAD),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_terminal)
+            .setContentTitle(getString(R.string.upload_notification_uploading, name))
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(0, getString(android.R.string.cancel), cancelIntent)
+        if (totalBytes > 0) {
+            builder.setContentText("$pct%").setProgress(100, pct, false)
+        } else {
+            builder.setProgress(0, 0, true)
+        }
+        getSystemService(NotificationManager::class.java)
+            .notify(UPLOAD_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun showUploadDone(name: String, error: Throwable?) {
+        val text = if (error == null) {
+            getString(R.string.upload_notification_done, name)
+        } else {
+            getString(R.string.upload_notification_failed, error.message ?: "")
+        }
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_terminal)
+            .setContentTitle(getString(R.string.notification_title))
+            .setContentText(text)
+            .setAutoCancel(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            .notify(UPLOAD_NOTIFICATION_ID, notification)
+    }
+
+    private fun cancelUploadNotification() {
+        getSystemService(NotificationManager::class.java).cancel(UPLOAD_NOTIFICATION_ID)
+    }
+
     fun snapshot(): Snapshot {
         val bufferBytes: Int
         val attached: Boolean
@@ -774,8 +914,10 @@ class SshConnectionService : Service() {
 
     companion object {
         const val ACTION_STOP = "org.hogel.pocketssh.action.STOP_CONNECTION"
+        const val ACTION_CANCEL_UPLOAD = "org.hogel.pocketssh.action.CANCEL_UPLOAD"
         private const val CHANNEL_ID = "ssh_connection"
         private const val NOTIFICATION_ID = 1001
+        private const val UPLOAD_NOTIFICATION_ID = 1002
         private const val MAX_BUFFER_BYTES = 256 * 1024
         private const val BACKLOG_REPLAY_CHUNK_BYTES = 16 * 1024
         private const val KEEPALIVE_INTERVAL_SECONDS = 120L

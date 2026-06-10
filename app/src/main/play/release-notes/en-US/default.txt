@@ -1,1 +1,3 @@
-- Fixed a hang that could occur when disconnecting from a session.
+- Tapping near a link now opens it more reliably.
+- Uploads run in the background with a progress notification.
+- Large file uploads no longer run out of memory.

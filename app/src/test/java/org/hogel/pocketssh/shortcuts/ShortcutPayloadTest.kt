@@ -192,9 +192,11 @@ class ShortcutPayloadTest {
         assertTrue(parseShortcutActions("{TMUX-PREFIX}").single() === ShortcutAction.SendTmuxPrefix)
         assertTrue(parseShortcutActions("{TMUX_PREFIX}").single() === ShortcutAction.SendTmuxPrefix)
         assertTrue(parseShortcutActions("{COPY}").single() === ShortcutAction.Copy)
-        assertTrue(parseShortcutActions("{PASTE}").single() === ShortcutAction.Paste)
         assertTrue(parseShortcutActions("{IMAGE-PASTE}").single() === ShortcutAction.ImagePaste)
         assertTrue(parseShortcutActions("{IMAGE_PASTE}").single() === ShortcutAction.ImagePaste)
+        assertTrue(parseShortcutActions("{SCP}").single() === ShortcutAction.Scp)
+        assertTrue(parseShortcutActions("{CTRL-INPUT}").single() === ShortcutAction.CtrlInput)
+        assertTrue(parseShortcutActions("{CTRL_INPUT}").single() === ShortcutAction.CtrlInput)
     }
 
     @Test

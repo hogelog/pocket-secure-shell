@@ -97,6 +97,9 @@ jobs:
         run: |
           RELEASE_URL="${SERVER_URL}/${REPO}/releases/tag/${TAG}"
           APK_URL="${SERVER_URL}/${REPO}/releases/download/${TAG}/${APK_NAME}"
+          META="app/build/outputs/apk/debug/output-metadata.json"
+          VERSION_NAME=$(jq -r '.elements[0].versionName' "$META")
+          VERSION_CODE=$(jq -r '.elements[0].versionCode' "$META")
           MARKER="<!-- pocketsecureshell-ci-build -->"
 
           # Hide previous CI build comments on this PR
@@ -129,6 +132,7 @@ jobs:
           gh pr comment "$PR_NUMBER" --body "${MARKER}
           CI build for \`${HEAD_SHA}\` is ready.
 
+          - Version: \`${VERSION_NAME}\` (versionCode \`${VERSION_CODE}\`)
           - Release: ${RELEASE_URL}
           - APK: [\`${APK_NAME}\`](${APK_URL})
           - Revision: \`${HEAD_SHA}\`"

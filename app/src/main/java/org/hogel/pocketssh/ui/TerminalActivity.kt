@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
@@ -13,10 +14,14 @@ import android.content.pm.PackageManager
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
+import android.provider.OpenableColumns
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.text.InputFilter
+import android.text.InputType
 import android.util.Log
 import android.util.TypedValue
 import android.view.GestureDetector
@@ -28,10 +33,14 @@ import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.EditText
+import android.widget.ArrayAdapter
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -40,6 +49,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -61,6 +71,7 @@ import org.hogel.pocketssh.shortcuts.resolve
 import org.hogel.pocketssh.ssh.BiometricAuthenticationException
 import org.hogel.pocketssh.ssh.BiometricAuthenticator
 import org.hogel.pocketssh.ssh.HostKeyPrompt
+import org.hogel.pocketssh.ssh.RemoteListing
 import org.hogel.pocketssh.ssh.SshConnectionService
 import org.hogel.pocketssh.ssh.SshKeyManager
 import org.hogel.pocketssh.tmux.TmuxControlWindow
@@ -223,10 +234,15 @@ class TerminalActivity : AppCompatActivity() {
     // buffer from growing without bound across the session.
     private val recentOutputTail = java.io.ByteArrayOutputStream()
 
-    // Active image-upload progress dialog, or null when no upload is in
-    // flight. Held so onDestroy can dismiss it to avoid a window leak when
-    // the activity tears down mid-upload.
-    private var uploadDialog: AlertDialog? = null
+
+    // Active SCP file-browser and transfer-progress dialogs, plus the directory
+    // a pending upload targets. Held so onDestroy can dismiss any open window
+    // and the document picker callback knows where to put the file.
+    private var scpBrowserDialog: AlertDialog? = null
+    private var scpTransferDialog: AlertDialog? = null
+    private var scpUploadTargetDir: String? = null
+    private var scpBrowserListView: ListView? = null
+    private var scpBrowserPathHeader: TextView? = null
 
     private var fontSizePx = DEFAULT_FONT_SIZE_PX
     private val terminalPrefs by lazy { getSharedPreferences(PREFS_TERMINAL, Context.MODE_PRIVATE) }
@@ -321,6 +337,13 @@ class TerminalActivity : AppCompatActivity() {
     private val imagePickerLauncher = registerForActivityResult(
         ActivityResultContracts.PickVisualMedia(),
     ) { uri -> if (uri != null) onImagePicked(uri) }
+
+    // SAF file picker for SCP upload. The chosen file is uploaded into
+    // [scpUploadTargetDir], the directory the browser was showing when the
+    // user tapped "Upload here".
+    private val scpUploadPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) onScpUploadFilePicked(uri) }
 
     private val outputListener: (ByteArray) -> Unit = ::handleSshOutput
 
@@ -754,7 +777,7 @@ class TerminalActivity : AppCompatActivity() {
      * Rebuild the shortcut bar. The bottom row flattens every matching
      * [ContextGroup] into a single horizontally-scrolling line, ordered
      * specifity high → low so the active foreground command's deck sits
-     * left of the always-on `/`–`^D` slice. The learned-suggestions row
+     * left of the always-on slice. The learned-suggestions row
      * stays above it when bigram counts yield candidates for the active
      * `(context, prev)`. Ctrl is the left-most button on the bottom row as
      * a sticky modifier toggle; it can't be expressed inside a
@@ -864,51 +887,60 @@ class TerminalActivity : AppCompatActivity() {
 
     /**
      * Rebuild the FAB speed-dial menu. Each [ContextGroup] that contributed a
-     * non-empty `fabItems` list becomes one horizontal row; rows are stacked
-     * specifity high → low (closest match at the top, "always" at the bottom).
-     *
-     * The bottom row (the "always" group) is augmented with a system-level
-     * secure-input toggle button at its left edge, so the toggle is always
-     * reachable from any context without needing a dedicated row. When the
-     * always group has no FAB items the toggle becomes the row's only entry.
+     * non-empty `fabItems` list becomes one or more horizontal rows, wrapping
+     * at [FAB_MAX_COLUMNS] buttons; rows are stacked specifity high → low
+     * (closest match at the top, "always" at the bottom). The secure-input
+     * toggle is an ordinary `{SECURE-INPUT}` item in the bundled defaults, so
+     * everything here is just the resolved shortcuts.
      */
+    @SuppressLint("ClickableViewAccessibility")
     private fun rebuildFab(rows: List<List<Shortcut>>) {
         val container = binding.fabActions
         container.removeAllViews()
 
-        // Ensure there is always at least one row so the system toggle has
-        // somewhere to live.
-        val effectiveRows = if (rows.isEmpty()) listOf(emptyList()) else rows
-        val lastIndex = effectiveRows.size - 1
-        for ((index, row) in effectiveRows.withIndex()) {
-            val rowView = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { gravity = android.view.Gravity.END }
-                gravity = android.view.Gravity.END
-            }
-            if (index == lastIndex) {
-                val systemBtn = makeAuxButton(getString(R.string.password_mode_label)) {
-                    setSecureInput(!secureInputActive)
-                    setFabExpanded(false)
+        for (row in rows) {
+            // Wrap a wide group into stacked rows of at most FAB_MAX_COLUMNS so
+            // the buttons stay thumb-reachable instead of running off-screen.
+            for (chunk in row.chunked(FAB_MAX_COLUMNS)) {
+                val rowView = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { gravity = android.view.Gravity.END }
+                    gravity = android.view.Gravity.END
                 }
-                systemBtn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
-                rowView.addView(systemBtn)
-            }
-            for (shortcut in row) {
-                val btn = makeAuxButton(shortcut.label) {
-                    runShortcutActions(parseShortcutActions(shortcut.payload))
-                    setFabExpanded(false)
+                for (shortcut in chunk) {
+                    val btn = makeAuxButton(shortcut.label) {
+                        runShortcutActions(parseShortcutActions(shortcut.payload))
+                        setFabExpanded(false)
+                    }
+                    // Override the bar-button background with the FAB variant —
+                    // same fill but with a 1dp stroke, so adjacent buttons render
+                    // thin inter-cell borders without a divider mechanism.
+                    btn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
+                    // Reveal the payload in the center overlay while pressed so the
+                    // emoji label stays decipherable, hiding it as soon as the touch
+                    // slides off the button (which also cancels the click). Returning
+                    // false keeps the click handler firing on release, so a press can
+                    // be a peek-only confirmation.
+                    btn.setOnTouchListener { v, event ->
+                        when (event.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> showPayloadFeedback(shortcut)
+                            MotionEvent.ACTION_MOVE ->
+                                if (event.x in 0f..v.width.toFloat() && event.y in 0f..v.height.toFloat()) {
+                                    showPayloadFeedback(shortcut)
+                                } else {
+                                    hideSwipeFeedback()
+                                }
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> hideSwipeFeedback()
+                        }
+                        false
+                    }
+                    rowView.addView(btn)
                 }
-                // Override the bar-button background with the FAB variant —
-                // same fill but with a 1dp stroke, so adjacent buttons render
-                // thin inter-cell borders without a divider mechanism.
-                btn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
-                rowView.addView(btn)
+                container.addView(rowView)
             }
-            container.addView(rowView)
         }
     }
 
@@ -924,8 +956,10 @@ class TerminalActivity : AppCompatActivity() {
             is ShortcutAction.SendKey -> sendKeyCode(action.keyCode, action.keyMod)
             is ShortcutAction.SendTmuxPrefix -> writeToSsh(byteArrayOf(readTmuxPrefixByte()))
             is ShortcutAction.Copy -> startTextSelection()
-            is ShortcutAction.Paste -> pasteClipboardToSsh()
             is ShortcutAction.ImagePaste -> launchImagePicker()
+            is ShortcutAction.Scp -> launchScpBrowser()
+            is ShortcutAction.SecureInput -> setSecureInput(!secureInputActive)
+            is ShortcutAction.CtrlInput -> showControlInputDialog()
         }
         clearStickyModifiers()
     }
@@ -943,6 +977,69 @@ class TerminalActivity : AppCompatActivity() {
             .start()
     }
 
+    /**
+     * Show the control-input dialog: a grid of common Ctrl sequences plus a
+     * one-character field for any other letter. Every entry is sent by feeding
+     * a `^X` payload back through [parseShortcutActions], so the C0 mapping
+     * stays in one place ([ctrlByteFor]).
+     */
+    private fun showControlInputDialog() {
+        val pad = dpToPx(16)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+
+        var dialog: AlertDialog? = null
+        fun send(payload: String) {
+            runShortcutActions(parseShortcutActions(payload))
+            dialog?.dismiss()
+        }
+
+        CTRL_INPUT_PRESETS.chunked(CTRL_INPUT_COLUMNS).forEach { chunk ->
+            val rowView = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (preset in chunk) {
+                val btn = makeAuxButton(preset) { send(preset) }
+                btn.layoutParams = auxButtonLayoutParams()
+                rowView.addView(btn)
+            }
+            root.addView(rowView)
+        }
+
+        val edit = EditText(this).apply {
+            hint = getString(R.string.ctrl_input_hint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            filters = arrayOf(InputFilter.LengthFilter(1))
+            minWidth = dpToPx(64)
+        }
+        fun sendTyped(): Boolean {
+            val ch = edit.text.toString().firstOrNull() ?: return false
+            send("^$ch")
+            return true
+        }
+        edit.setOnEditorActionListener { _, _, _ -> sendTyped() }
+
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dpToPx(2), dpToPx(12), dpToPx(2), 0)
+            addView(TextView(this@TerminalActivity).apply { text = getString(R.string.ctrl_input_prefix) })
+            addView(edit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(
+                makeAuxButton(getString(R.string.ctrl_input_send)) { sendTyped() }
+                    .apply { layoutParams = auxButtonLayoutParams() },
+            )
+        }
+        root.addView(inputRow)
+
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.ctrl_input_title)
+            .setView(root)
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        dialog.show()
+    }
+
     private fun launchImagePicker() {
         imagePickerLauncher.launch(
             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
@@ -950,14 +1047,13 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Upload the picked image to the remote host via SCP and, on success,
+     * Upload the picked image to the remote host via SFTP and, on success,
      * type its `/tmp/...` path into the SSH stdin so the user can submit
      * it to Claude Code by pressing Enter.
      *
-     * A non-cancelable progress dialog blocks the UI for the duration so a
-     * second pick can't kick off a concurrent upload; the Cancel button
-     * interrupts the SCP worker so a hung network upload can be abandoned
-     * without disconnecting the whole SSH session.
+     * The transfer runs in the background (progress/result surface through the
+     * service notification) so the terminal stays usable; the path is typed
+     * on success only if this activity is still around to receive the result.
      */
     private fun onImagePicked(uri: Uri) {
         val svc = service
@@ -972,18 +1068,324 @@ class TerminalActivity : AppCompatActivity() {
             timeZone = TimeZone.getTimeZone("Asia/Tokyo")
         }.format(Date())
         val filename = "pocketssh-$timestamp.$ext"
-        val bytes = try {
-            resolver.openInputStream(uri)?.use { it.readBytes() }
+
+        svc.uploadFile(
+            { resolver.openInputStream(uri) ?: throw IOException("Cannot open picked image") },
+            filename,
+            REMOTE_TMP_DIR,
+            queryFileSize(uri),
+        ) { error ->
+            if (error == null) {
+                val pathRef = "$REMOTE_TMP_DIR/$filename "
+                writeToSsh(pathRef.toByteArray(Charsets.UTF_8))
+            }
+        }
+    }
+
+    private fun extensionForMime(mime: String): String = when (mime.lowercase()) {
+        "image/png" -> "png"
+        "image/jpeg", "image/jpg" -> "jpg"
+        "image/webp" -> "webp"
+        "image/gif" -> "gif"
+        "image/heic" -> "heic"
+        "image/heif" -> "heif"
+        else -> "png"
+    }
+
+    /**
+     * Open the two-way SCP/SFTP file browser, starting at the login home (`.`
+     * resolves to it server-side). Inside the browser the user navigates remote
+     * directories, taps a file to download it to the device Downloads folder, or
+     * taps "Upload here" to push a local file into the current directory.
+     */
+    private fun launchScpBrowser() {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        scpNavigate(".")
+    }
+
+    /** List [path] over SFTP and (re)render the browser dialog, or toast on failure. */
+    private fun scpNavigate(path: String) {
+        val svc = service ?: return
+        svc.listRemoteDir(path) { result ->
+            result.fold(
+                onSuccess = { showScpListing(it) },
+                onFailure = { e ->
+                    // e.message is shown only in a local toast, never sent anywhere.
+                    Toast.makeText(
+                        this,
+                        getString(R.string.scp_list_failed, e.message ?: ""),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                },
+            )
+        }
+    }
+
+    private fun showScpListing(listing: RemoteListing) {
+        val path = listing.path
+        val labels = mutableListOf<String>()
+        val onClick = mutableListOf<() -> Unit>()
+        if (path != "/") {
+            labels.add("⬆  ..")
+            onClick.add { scpNavigate(joinRemotePath(path, "..")) }
+        }
+        for (entry in listing.entries) {
+            if (entry.name == "." || entry.name == "..") continue
+            val target = joinRemotePath(path, entry.name)
+            if (entry.isDirectory) {
+                labels.add("📁  ${entry.name}/")
+                onClick.add { scpNavigate(target) }
+            } else {
+                labels.add("📄  ${entry.name}")
+                onClick.add { showScpFileActions(target, entry.name) }
+            }
+        }
+        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
+
+        val existing = scpBrowserDialog
+        if (existing != null && existing.isShowing) {
+            scpBrowserPathHeader?.text = path
+            scpBrowserListView?.let { list ->
+                list.adapter = adapter
+                list.setOnItemClickListener { _, _, pos, _ -> onClick[pos]() }
+            }
+            return
+        }
+
+        val pad = dpToPx(16)
+        val header = TextView(this).apply {
+            text = path
+            setPadding(pad, pad, pad, dpToPx(8))
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        val list = ListView(this).apply {
+            this.adapter = adapter
+            setOnItemClickListener { _, _, pos, _ -> onClick[pos]() }
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(header)
+            addView(
+                list,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(360)),
+            )
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.scp_browser_title)
+            .setView(container)
+            .setNeutralButton(R.string.scp_upload_here, null)
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        scpBrowserListView = list
+        scpBrowserPathHeader = header
+        scpBrowserDialog = dialog
+        dialog.setOnDismissListener {
+            scpBrowserDialog = null
+            scpBrowserListView = null
+            scpBrowserPathHeader = null
+        }
+        dialog.show()
+        // Override the neutral button after show() so it does NOT auto-dismiss
+        // on the navigation taps; for upload it reads the *current* directory
+        // (header text changes as the user navigates), then closes and opens
+        // the document picker.
+        dialog.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener {
+            scpUploadTargetDir = scpBrowserPathHeader?.text?.toString() ?: path
+            dialog.dismiss()
+            scpUploadPickerLauncher.launch(arrayOf("*/*"))
+        }
+    }
+
+    /** Join a remote dir and a child name with `/`; `..` is resolved server-side. */
+    private fun joinRemotePath(dir: String, name: String): String =
+        if (dir.endsWith("/")) "$dir$name" else "$dir/$name"
+
+    /** Offer Download (save to Downloads) or Copy (file contents to clipboard). */
+    private fun showScpFileActions(remotePath: String, displayName: String) {
+        val items = arrayOf(
+            getString(R.string.scp_file_action_download),
+            getString(R.string.scp_file_action_copy),
+        )
+        AlertDialog.Builder(this)
+            .setTitle(displayName)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> confirmScpDownload(remotePath, displayName)
+                    1 -> startScpCopyToClipboard(remotePath, displayName)
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun confirmScpDownload(remotePath: String, displayName: String) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.scp_download_confirm_title)
+            .setMessage(getString(R.string.scp_download_confirm_message, displayName))
+            .setPositiveButton(android.R.string.ok) { _, _ -> startScpDownload(remotePath, displayName) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * Download [remotePath] into memory and put its contents on the clipboard as
+     * UTF-8 text. A cancelable progress dialog blocks until the SFTP worker
+     * finishes; canceling interrupts the worker.
+     */
+    private fun startScpCopyToClipboard(remotePath: String, displayName: String) {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val out = java.io.ByteArrayOutputStream()
+        val cancelled = AtomicBoolean(false)
+        val dialog = buildScpProgressDialog(R.string.scp_copying)
+        val future = svc.downloadFile(remotePath, out) { error ->
+            if (cancelled.get()) return@downloadFile
+            scpTransferDialog = null
+            dialog.dismiss()
+            if (error == null) {
+                val text = out.toString(Charsets.UTF_8.name())
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText(displayName, text))
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_copy_done, displayName),
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_copy_failed, error.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        dialog.setButton(
+            DialogInterface.BUTTON_NEGATIVE,
+            getString(android.R.string.cancel),
+        ) { _, _ ->
+            cancelled.set(true)
+            scpTransferDialog = null
+            future?.cancel(true)
+            Toast.makeText(this, R.string.scp_copy_cancelled, Toast.LENGTH_SHORT).show()
+        }
+        scpTransferDialog = dialog
+        dialog.show()
+    }
+
+    /**
+     * Download [remotePath] into a new MediaStore Downloads entry named
+     * [displayName]. A cancelable progress dialog blocks until the SFTP worker
+     * finishes; canceling interrupts the worker and removes the pending entry.
+     */
+    private fun startScpDownload(remotePath: String, displayName: String) {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val resolver = contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, displayName)
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val targetUri = resolver.insert(collection, values)
+        if (targetUri == null) {
+            Toast.makeText(this, getString(R.string.scp_download_failed, ""), Toast.LENGTH_LONG).show()
+            return
+        }
+        val out = try {
+            resolver.openOutputStream(targetUri)
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to read picked image", e)
+            Log.e(TAG, "Failed to open download sink")
             null
         }
-        if (bytes == null) {
-            Toast.makeText(this, R.string.image_upload_read_failed, Toast.LENGTH_SHORT).show()
+        if (out == null) {
+            resolver.delete(targetUri, null, null)
+            Toast.makeText(this, getString(R.string.scp_download_failed, ""), Toast.LENGTH_LONG).show()
             return
         }
 
         val cancelled = AtomicBoolean(false)
+        val dialog = buildScpProgressDialog(R.string.scp_downloading)
+        val future = svc.downloadFile(remotePath, out) { error ->
+            try { out.close() } catch (_: Exception) {}
+            if (cancelled.get()) return@downloadFile
+            scpTransferDialog = null
+            dialog.dismiss()
+            if (error == null) {
+                val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+                resolver.update(targetUri, done, null, null)
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_download_done, displayName),
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                resolver.delete(targetUri, null, null)
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_download_failed, error.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        dialog.setButton(
+            DialogInterface.BUTTON_NEGATIVE,
+            getString(android.R.string.cancel),
+        ) { _, _ ->
+            cancelled.set(true)
+            scpTransferDialog = null
+            future?.cancel(true)
+            try { out.close() } catch (_: Exception) {}
+            resolver.delete(targetUri, null, null)
+            Toast.makeText(this, R.string.scp_download_cancelled, Toast.LENGTH_SHORT).show()
+        }
+        scpTransferDialog = dialog
+        dialog.show()
+    }
+
+    /** Upload the SAF-picked [uri] into [scpUploadTargetDir] captured at pick time. */
+    private fun onScpUploadFilePicked(uri: Uri) {
+        val remoteDir = scpUploadTargetDir
+        scpUploadTargetDir = null
+        if (remoteDir == null) return
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val displayName = queryDisplayName(uri) ?: "upload.bin"
+        // Runs in the background; progress and result surface through the
+        // service notification, so the terminal stays usable during the upload.
+        svc.uploadFile(
+            { contentResolver.openInputStream(uri) ?: throw IOException("Cannot open picked file") },
+            displayName,
+            remoteDir,
+            queryFileSize(uri),
+        ) {}
+    }
+
+    private fun queryDisplayName(uri: Uri): String? =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+
+    /** Picked-file size in bytes for the upload progress bar, or -1 if unknown. */
+    private fun queryFileSize(uri: Uri): Long =
+        contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
+        } ?: -1L
+
+    /** A non-cancelable-by-back, indeterminate progress dialog for an SCP transfer. */
+    private fun buildScpProgressDialog(titleRes: Int): AlertDialog {
         val padding = dpToPx(24)
         val progressView = ProgressBar(this).apply { isIndeterminate = true }
         val container = FrameLayout(this).apply {
@@ -997,53 +1399,11 @@ class TerminalActivity : AppCompatActivity() {
                 ),
             )
         }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.image_upload_in_progress)
+        return AlertDialog.Builder(this)
+            .setTitle(titleRes)
             .setView(container)
             .setCancelable(false)
             .create()
-
-        val uploadFuture = svc.uploadBytes(bytes, filename, REMOTE_TMP_DIR) { error ->
-            if (cancelled.get()) return@uploadBytes
-            uploadDialog = null
-            if (error == null) {
-                // Kick off the SSH write before dismiss() so the SSH round-trip
-                // overlaps the dialog's exit animation; otherwise the path
-                // appears noticeably after the dialog disappears.
-                val pathRef = "$REMOTE_TMP_DIR/$filename "
-                writeToSsh(pathRef.toByteArray(Charsets.UTF_8))
-            }
-            dialog.dismiss()
-            if (error != null) {
-                Toast.makeText(
-                    this,
-                    getString(R.string.image_upload_failed, error.message ?: ""),
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        }
-
-        dialog.setButton(
-            DialogInterface.BUTTON_NEGATIVE,
-            getString(R.string.image_upload_cancel),
-        ) { _, _ ->
-            cancelled.set(true)
-            uploadDialog = null
-            uploadFuture?.cancel(true)
-            Toast.makeText(this, R.string.image_upload_cancelled, Toast.LENGTH_SHORT).show()
-        }
-        uploadDialog = dialog
-        dialog.show()
-    }
-
-    private fun extensionForMime(mime: String): String = when (mime.lowercase()) {
-        "image/png" -> "png"
-        "image/jpeg", "image/jpg" -> "jpg"
-        "image/webp" -> "webp"
-        "image/gif" -> "gif"
-        "image/heic" -> "heic"
-        "image/heif" -> "heif"
-        else -> "png"
     }
 
     private fun auxButtonLayoutParams(): LinearLayout.LayoutParams {
@@ -1546,6 +1906,11 @@ class TerminalActivity : AppCompatActivity() {
 
     private fun showSwipeFeedback(direction: Int) {
         val shortcut = activeSwipeShortcut(direction) ?: return
+        showPayloadFeedback(shortcut)
+    }
+
+    /** Show [shortcut]'s label and resolved payload in the center overlay. */
+    private fun showPayloadFeedback(shortcut: Shortcut) {
         val preview = previewSwipePayload(shortcut.payload)
         binding.swipeFeedback.text = getString(R.string.swipe_feedback, shortcut.label, preview)
         binding.swipeFeedback.visibility = View.VISIBLE
@@ -1607,13 +1972,17 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Map a tap on the terminal to a URL, if the tapped word resolves to one.
+     * Map a tap on the terminal to a URL, if one sits at or near the tap.
      * Returns true (and shows the confirm dialog) when a URL is found, in
      * which case the caller should suppress the default tap behaviour.
      *
+     * The whole wrapped line is scanned (not just the tapped word), so a tap
+     * landing on prose next to a link still opens it, and the tapped row plus
+     * the two rows above and below are checked so a slightly-off tap counts.
+     *
      * Bounded to the visible screen rows so that scrollback (`mTopRow < 0`)
-     * is not handled — `TerminalBuffer.getWordAtLocation` only walks
-     * line-wrap continuations in the screen range, not the transcript.
+     * is not handled — the wrapped-line walk only follows line-wrap
+     * continuations in the screen range, not the transcript.
      */
     private fun tryOpenLinkAt(event: MotionEvent): Boolean {
         val terminalView = binding.terminalView
@@ -1621,13 +1990,44 @@ class TerminalActivity : AppCompatActivity() {
         val coords = terminalView.getColumnAndRow(event, true)
         val column = coords[0]
         val row = coords[1]
-        if (row < 0 || row >= emulator.mRows) return false
         if (column < 0 || column >= emulator.mColumns) return false
-        val word = emulator.screen.getWordAtLocation(column, row)
-        if (word.isNullOrBlank()) return false
-        val url = LinkDetector.extractUrls(word).firstOrNull() ?: return false
-        showOpenLinkConfirmDialog(url)
-        return true
+        for (candidate in intArrayOf(row, row - 1, row + 1, row - 2, row + 2)) {
+            if (candidate < 0 || candidate >= emulator.mRows) continue
+            val url = findUrlNearTap(emulator, column, candidate) ?: continue
+            showOpenLinkConfirmDialog(url)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Scan the whole wrapped line that `row` belongs to and return the URL
+     * nearest the tapped column, or null if the line holds none.
+     *
+     * The wrap walk and offset arithmetic mirror
+     * `TerminalBuffer.getWordAtLocation`: rows before the last one in a wrapped
+     * line are full-width, so the flat text offset of the tap is
+     * `(row - y1) * columns + column`.
+     */
+    private fun findUrlNearTap(emulator: TerminalEmulator, column: Int, row: Int): String? {
+        val screen = emulator.screen
+        val cols = emulator.mColumns
+        val rows = emulator.mRows
+        var y1 = row
+        var y2 = row
+        while (y1 > 0 && !screen.getSelectedText(0, y1 - 1, cols, row, true, true).contains('\n')) y1--
+        while (y2 < rows && !screen.getSelectedText(0, row, cols, y2 + 1, true, true).contains('\n')) y2++
+        val text = screen.getSelectedText(0, y1, cols, y2, true, true)
+        val matches = LinkDetector.extractUrlMatches(text)
+        if (matches.isEmpty()) return null
+        val tapOffset = (row - y1) * cols + column
+        return matches.minByOrNull { match ->
+            when {
+                tapOffset < match.start -> match.start - tapOffset
+                tapOffset >= match.endExclusive -> tapOffset - match.endExclusive + 1
+                else -> 0
+            }
+        }?.url
     }
 
     private fun showOpenLinkConfirmDialog(url: String) {
@@ -1732,8 +2132,10 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        uploadDialog?.dismiss()
-        uploadDialog = null
+        scpBrowserDialog?.dismiss()
+        scpBrowserDialog = null
+        scpTransferDialog?.dismiss()
+        scpTransferDialog = null
         pendingTitleHandler.removeCallbacks(pendingTitleRunnable)
         if (bound) {
             service?.detachOutputListener()
@@ -1904,6 +2306,10 @@ class TerminalActivity : AppCompatActivity() {
         private const val DEFAULT_TMUX_PREFIX_LETTER = "b"
         private const val TAG = "TerminalActivity"
         private const val FAB_COLLAPSED_ALPHA = 0.3f
+        private const val FAB_MAX_COLUMNS = 3
+        private const val CTRL_INPUT_COLUMNS = 4
+        private val CTRL_INPUT_PRESETS =
+            listOf("^C", "^D", "^L", "^R", "^Z", "^A", "^E", "^U", "^K", "^W", "^[")
         private const val PROBE_TIMEOUT_MS = 4_000L
 
         // Rolling window of SSH output kept around for password-prompt

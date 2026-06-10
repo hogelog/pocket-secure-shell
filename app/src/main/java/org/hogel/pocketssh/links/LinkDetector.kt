@@ -15,10 +15,19 @@ object LinkDetector {
 
     private const val TRAILING_PUNCT = ".,;:!?\"'>"
 
+    /** A detected URL together with its half-open span in the source text. */
+    data class UrlMatch(val url: String, val start: Int, val endExclusive: Int)
+
     fun extractUrls(text: String): List<String> =
+        extractUrlMatches(text).map { it.url }
+
+    fun extractUrlMatches(text: String): List<UrlMatch> =
         URL_PATTERN.findAll(text)
-            .map { trimTrailingPunctuation(it.value) }
-            .filter { it.isNotEmpty() }
+            .mapNotNull { match ->
+                val url = trimTrailingPunctuation(match.value)
+                if (url.isEmpty()) null
+                else UrlMatch(url, match.range.first, match.range.first + url.length)
+            }
             .toList()
 
     private fun trimTrailingPunctuation(raw: String): String {
