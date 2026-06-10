@@ -154,6 +154,16 @@ class TmuxControlClientTest {
         assertEquals(2, cmd.trim().lines().size)
     }
 
+    @Test
+    fun `refreshClientSize reports the client size and consumes its reply`() {
+        val cmd = String(client.refreshClientSize(52, 38), Charsets.US_ASCII)
+        assertEquals("refresh-client -C 52x38\n", cmd)
+        client.requestCapture("%1")
+        feed("%begin 1 1 0\n%end 1 1 0\n") // refresh-client reply: dropped
+        feed("%begin 1 2 0\nhi\n%end 1 2 0\n") // capture reply still routes
+        assertEquals("%1", captures.single().first)
+    }
+
     // --- capture-pane reply body ---
 
     @Test

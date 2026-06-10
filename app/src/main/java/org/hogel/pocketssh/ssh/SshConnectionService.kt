@@ -115,6 +115,14 @@ class SshConnectionService : Service() {
     private var controlClient: TmuxControlClient? = null
     private var controlListener: TmuxControlListener? = null
 
+    // Client size to report to tmux in control mode (a control client has no
+    // usable tty size). Sent with the first list-windows — after
+    // %session-changed, so it can't be stolen by the attach-time reply block —
+    // and again from [resizeWindow] on later changes.
+    private var clientColumns = 0
+    private var clientRows = 0
+    private var clientSizeSent = false
+
     @Volatile private var paneOutputCount = 0
     @Volatile private var capturesSent = 0
     @Volatile private var captureRepliesReceived = 0
@@ -194,6 +202,9 @@ class SshConnectionService : Service() {
             connectionLabel = "${params.username}@${params.host}:${params.port}"
             useTmux = params.useTmux
             useTmuxControlMode = params.useTmux && params.tmuxControlMode
+            clientColumns = columns.coerceAtLeast(1)
+            clientRows = rows.coerceAtLeast(1)
+            clientSizeSent = false
             paneOutputCount = 0
             capturesSent = 0
             captureRepliesReceived = 0
@@ -425,9 +436,17 @@ class SshConnectionService : Service() {
 
     private fun sendWindowListNow() {
         val out = session?.stdin ?: return
-        val cmd = controlClient?.requestWindows() ?: return
+        val control = controlClient ?: return
+        val size = if (clientSizeSent) {
+            null
+        } else {
+            clientSizeSent = true
+            control.refreshClientSize(clientColumns, clientRows)
+        }
+        val cmd = control.requestWindows()
         sshWriteExecutor.execute {
             try {
+                if (size != null) out.write(size)
                 out.write(cmd)
                 out.flush()
             } catch (e: Exception) {
@@ -541,6 +560,28 @@ class SshConnectionService : Service() {
     }
 
     fun resizeWindow(columns: Int, rows: Int) {
+        val control = controlClient
+        if (control != null) {
+            // Control mode: the SSH PTY size is meaningless to tmux; the
+            // client size travels as a refresh-client command instead.
+            clientColumns = columns.coerceAtLeast(1)
+            clientRows = rows.coerceAtLeast(1)
+            // Before the first list-windows the size rides along with it
+            // (sent only after %session-changed, when the command FIFO is
+            // safe from the attach-time reply block).
+            if (!clientSizeSent) return
+            val out = session?.stdin ?: return
+            val cmd = control.refreshClientSize(clientColumns, clientRows)
+            sshWriteExecutor.execute {
+                try {
+                    out.write(cmd)
+                    out.flush()
+                } catch (e: Exception) {
+                    Log.e(TAG, "refresh-client error", e)
+                }
+            }
+            return
+        }
         // resize sends a packet, so it must not run on the main thread.
         runCatching {
             sshWriteExecutor.execute {

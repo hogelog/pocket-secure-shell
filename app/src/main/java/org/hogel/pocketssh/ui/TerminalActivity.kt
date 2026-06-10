@@ -1755,6 +1755,12 @@ class TerminalActivity : AppCompatActivity() {
             binding.terminalView.invalidate()
         }
         override fun onTitleChanged(changedSession: TerminalSession) {
+            // Control mode: pane titles are whatever the foreground app set
+            // (Claude Code animates a spinner there several times a second),
+            // not the TmuxTitle wire format — and every pane fires this
+            // callback. Parsing them would thrash applyContext and the
+            // shortcut bar; the app context comes from list-windows instead.
+            if (paneManager != null) return
             val title = changedSession.title
             // Cache on the service so a subsequent activity instance can pick
             // up the active app context without waiting for tmux to re-emit

@@ -213,6 +213,14 @@ class TmuxControlClient(
         return "new-window\n".toByteArray(Charsets.US_ASCII)
     }
 
+    /** Build a `refresh-client -C` reporting the client size. A control client
+     *  has no usable tty size, so without this tmux keeps the session at its
+     *  80x24 default and every pane renders for the wrong width. */
+    fun refreshClientSize(columns: Int, rows: Int): ByteArray {
+        enqueueCommand(Pending.Other)
+        return "refresh-client -C ${columns}x$rows\n".toByteArray(Charsets.US_ASCII)
+    }
+
     /** Point keystrokes at [paneId] — the window the user is viewing. */
     fun setInputPane(paneId: String) {
         activePaneId = paneId
