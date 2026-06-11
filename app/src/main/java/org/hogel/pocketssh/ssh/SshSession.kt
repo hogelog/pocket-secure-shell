@@ -37,19 +37,25 @@ class SshSession(
     fun connect() {
         // Publish the Connection before the blocking handshake so a concurrent
         // [disconnect] (e.g. the user aborting while still CONNECTING) can close
-        // it and unblock us. Connection.close() is synchronized on the same
-        // monitor as connect()/authenticate, so it cannot interrupt the KEX or
-        // auth read itself; those are bounded by the connect/kex timeouts
-        // below; but it does abort the (unsynchronized) shell-open phase and
-        // any wait after auth completes.
+        // it. Connection.close() is synchronized on the same monitor as
+        // connect()/authenticate, so it cannot interrupt the KEX or auth read
+        // itself — only the kexTimeout watchdog (which closes the underlying
+        // TransportManager off-monitor) can abort a stalled handshake. So the
+        // handshake is bounded solely by the connect/kex timeouts below; close()
+        // only aborts the (unsynchronized) shell-open phase and any post-auth
+        // wait.
         val conn = Connection(host, port)
         connection = conn
-        // kexTimeout = 0 disables the key-exchange watchdog. On a first
-        // connection the TOFU verifier blocks the kex on the receiver thread
-        // while the user confirms the host key fingerprint in a dialog; a
-        // bounded kexTimeout would abort the handshake (and leave a half-stored
-        // key) if they take too long. The TCP connect still has its own timeout.
-        conn.connect(hostKeyVerifier, CONNECT_TIMEOUT_MS, NO_KEX_TIMEOUT)
+        // kexTimeout bounds the key-exchange watchdog: a peer that accepts the
+        // TCP connection but stalls the SSH handshake (dying sshd, tarpit, wrong
+        // port, link dropping mid-kex) is aborted with a SocketTimeoutException
+        // instead of blocking connect() forever. On a first connection the TOFU
+        // verifier also blocks the kex on the receiver thread while the user
+        // confirms the host key in a dialog; the timeout is kept generous so an
+        // attentive user clears it in time, and if they exceed it the verifier
+        // still persists the key on accept, so SshConnectionService retries the
+        // connection once (now silent, key already trusted) to recover.
+        conn.connect(hostKeyVerifier, CONNECT_TIMEOUT_MS, KEX_TIMEOUT_MS)
 
         val authenticated = try {
             conn.authenticateWithPublicKey(username, signatureProxy)
@@ -313,7 +319,10 @@ class SshSession(
     companion object {
         private const val TAG = "SshSession"
         private const val CONNECT_TIMEOUT_MS = 10_000
-        private const val NO_KEX_TIMEOUT = 0
+        // Generous enough for an attentive user to confirm a TOFU host-key
+        // dialog before the key-exchange watchdog fires; a real unresponsive
+        // peer is still aborted within this window.
+        private const val KEX_TIMEOUT_MS = 30_000
         private const val TMUX_SESSION_NAME = "pocketssh"
         private const val UPLOAD_CHUNK_BYTES = 128 * 1024
     }
