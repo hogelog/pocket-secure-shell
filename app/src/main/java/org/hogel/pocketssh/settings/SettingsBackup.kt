@@ -79,44 +79,32 @@ object SettingsBackup {
         val version = root.optInt("version", -1)
         require(version == VERSION) { "Unsupported settings version: $version" }
 
-        val connectionObj = root.optJSONObject("connection")
-        val terminalObj = root.optJSONObject("terminal")
-        val groupsArr: JSONArray? = root.optJSONArray("context_groups")
-        val bigramsArr: JSONArray? = root.optJSONArray("bigrams")
-        // Decode upfront so a bad payload throws before we touch persisted state.
-        val groups = groupsArr?.let { ShortcutStore.decodeContextGroups(it) }
-        val bigrams = bigramsArr?.let { decodeBigrams(it) }
+        // Decode every section into typed locals before any write. A malformed
+        // value (e.g. a non-integer font size or a duplicate bigram) throws here,
+        // so the write phase below only ever puts already-validated values.
+        val connection = root.optJSONObject("connection")?.let { decodeConnection(it) }
+        val terminal = root.optJSONObject("terminal")?.let { decodeTerminal(it) }
+        val groups = root.optJSONArray("context_groups")?.let { ShortcutStore.decodeContextGroups(it) }
+        val bigrams = root.optJSONArray("bigrams")?.let { decodeBigrams(it) }
 
-        if (connectionObj != null) {
+        if (connection != null) {
             val prefs = context.getSharedPreferences(
                 MainActivity.PREFS_NAME, Context.MODE_PRIVATE,
             )
             prefs.edit {
-                if (connectionObj.has("host")) {
-                    putString(MainActivity.KEY_HOST, connectionObj.getString("host"))
-                }
-                if (connectionObj.has("port")) {
-                    putString(MainActivity.KEY_PORT, connectionObj.getString("port"))
-                }
-                if (connectionObj.has("username")) {
-                    putString(MainActivity.KEY_USERNAME, connectionObj.getString("username"))
-                }
-                if (connectionObj.has("use_tmux")) {
-                    putBoolean(MainActivity.KEY_USE_TMUX, connectionObj.getBoolean("use_tmux"))
-                }
-                if (connectionObj.has("tmux_prefix")) {
-                    putString(MainActivity.KEY_TMUX_PREFIX, connectionObj.getString("tmux_prefix"))
-                }
+                connection.host?.let { putString(MainActivity.KEY_HOST, it) }
+                connection.port?.let { putString(MainActivity.KEY_PORT, it) }
+                connection.username?.let { putString(MainActivity.KEY_USERNAME, it) }
+                connection.useTmux?.let { putBoolean(MainActivity.KEY_USE_TMUX, it) }
+                connection.tmuxPrefix?.let { putString(MainActivity.KEY_TMUX_PREFIX, it) }
             }
         }
-        if (terminalObj != null) {
+        if (terminal != null) {
             val terminalPrefs = context.getSharedPreferences(
                 TerminalActivity.PREFS_TERMINAL, Context.MODE_PRIVATE,
             )
             terminalPrefs.edit {
-                if (terminalObj.has("font_size_px")) {
-                    putInt(TerminalActivity.KEY_FONT_SIZE_PX, terminalObj.getInt("font_size_px"))
-                }
+                terminal.fontSizePx?.let { putInt(TerminalActivity.KEY_FONT_SIZE_PX, it) }
             }
         }
         if (groups != null) {
@@ -126,6 +114,28 @@ object SettingsBackup {
             BigramStore(context).replaceAll(bigrams)
         }
     }
+
+    private class Connection(
+        val host: String?,
+        val port: String?,
+        val username: String?,
+        val useTmux: Boolean?,
+        val tmuxPrefix: String?,
+    )
+
+    private fun decodeConnection(obj: JSONObject) = Connection(
+        host = if (obj.has("host")) obj.getString("host") else null,
+        port = if (obj.has("port")) obj.getString("port") else null,
+        username = if (obj.has("username")) obj.getString("username") else null,
+        useTmux = if (obj.has("use_tmux")) obj.getBoolean("use_tmux") else null,
+        tmuxPrefix = if (obj.has("tmux_prefix")) obj.getString("tmux_prefix") else null,
+    )
+
+    private class Terminal(val fontSizePx: Int?)
+
+    private fun decodeTerminal(obj: JSONObject) = Terminal(
+        fontSizePx = if (obj.has("font_size_px")) obj.getInt("font_size_px") else null,
+    )
 
     private fun encodeBigrams(rows: List<BigramStore.Bigram>): JSONArray {
         val arr = JSONArray()
@@ -142,16 +152,22 @@ object SettingsBackup {
     }
 
     private fun decodeBigrams(arr: JSONArray): List<BigramStore.Bigram> = buildList {
+        val seen = HashSet<Triple<String, String, String>>()
         for (i in 0 until arr.length()) {
             val obj = arr.getJSONObject(i)
-            add(
-                BigramStore.Bigram(
-                    context = obj.getString("context"),
-                    prev = obj.getString("prev"),
-                    next = obj.getString("next"),
-                    count = obj.getInt("count"),
-                ),
+            val bigram = BigramStore.Bigram(
+                context = obj.getString("context"),
+                prev = obj.getString("prev"),
+                next = obj.getString("next"),
+                count = obj.getInt("count"),
             )
+            // The bigram table's primary key is (context, prev, next); a duplicate
+            // would blow up replaceAll's insert mid-transaction, so reject it here
+            // before any section is written.
+            require(seen.add(Triple(bigram.context, bigram.prev, bigram.next))) {
+                "Duplicate bigram: ${bigram.context}/${bigram.prev}/${bigram.next}"
+            }
+            add(bigram)
         }
     }
 }
