@@ -313,21 +313,29 @@ class SshConnectionService : Service() {
      * either.
      */
     fun attachOutputListener(listener: (ByteArray) -> Unit) {
-        val backlog: ByteArray?
+        val backlogSize: Int
+        // Hold the lock across both the listener install and the backlog
+        // posts. `mainHandler.post` is non-blocking, so the lock is held only
+        // long enough to enqueue the chunks — but that window is enough to
+        // keep any concurrent `deliverOutput` from posting newer bytes
+        // between two backlog chunks, which would replay out of order. The
+        // backlog is still split into [BACKLOG_REPLAY_CHUNK_BYTES] posts so
+        // the UI thread can interleave input events between chunks.
         synchronized(outputLock) {
-            backlog = if (outputHistory.size() > 0) outputHistory.toByteArray() else null
+            val backlog = if (outputHistory.size() > 0) outputHistory.toByteArray() else null
+            backlogSize = backlog?.size ?: 0
+            backlog?.let { full ->
+                var offset = 0
+                while (offset < full.size) {
+                    val end = minOf(offset + BACKLOG_REPLAY_CHUNK_BYTES, full.size)
+                    val chunk = full.copyOfRange(offset, end)
+                    mainHandler.post { listener(chunk) }
+                    offset = end
+                }
+            }
             outputListener = listener
         }
-        trace { "attachOutputListener backlog=${backlog?.size ?: 0}" }
-        backlog?.let { full ->
-            var offset = 0
-            while (offset < full.size) {
-                val end = minOf(offset + BACKLOG_REPLAY_CHUNK_BYTES, full.size)
-                val chunk = full.copyOfRange(offset, end)
-                mainHandler.post { listener(chunk) }
-                offset = end
-            }
-        }
+        trace { "attachOutputListener backlog=$backlogSize" }
     }
 
     fun detachOutputListener() {
