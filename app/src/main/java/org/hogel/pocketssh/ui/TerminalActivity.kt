@@ -1073,6 +1073,10 @@ class TerminalActivity : AppCompatActivity() {
     private fun scpNavigate(path: String) {
         val svc = service ?: return
         svc.listRemoteDir(path) { result ->
+            // The callback is posted to the main thread and may arrive after the
+            // Activity is gone (e.g. the connection dropped and we finished while
+            // the listing was in flight). Showing a dialog then crashes.
+            if (isFinishing || isDestroyed) return@listRemoteDir
             result.fold(
                 onSuccess = { showScpListing(it) },
                 onFailure = { e ->
@@ -1209,6 +1213,7 @@ class TerminalActivity : AppCompatActivity() {
         val dialog = buildScpProgressDialog(R.string.scp_copying)
         val future = svc.downloadFile(remotePath, out) { error ->
             if (cancelled.get()) return@downloadFile
+            if (isFinishing || isDestroyed) return@downloadFile
             scpTransferDialog = null
             dialog.dismiss()
             if (error == null) {
@@ -1280,6 +1285,11 @@ class TerminalActivity : AppCompatActivity() {
         val future = svc.downloadFile(remotePath, out) { error ->
             try { out.close() } catch (_: Exception) {}
             if (cancelled.get()) return@downloadFile
+            if (isFinishing || isDestroyed) {
+                // Activity gone before the transfer finished; leave the pending
+                // MediaStore entry for the system to reap rather than touching UI.
+                return@downloadFile
+            }
             scpTransferDialog = null
             dialog.dismiss()
             if (error == null) {
