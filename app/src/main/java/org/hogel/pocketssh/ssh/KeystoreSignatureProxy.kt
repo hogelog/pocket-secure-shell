@@ -1,5 +1,6 @@
 package org.hogel.pocketssh.ssh
 
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.UserNotAuthenticatedException
 import com.trilead.ssh2.auth.SignatureProxy
 import com.trilead.ssh2.crypto.SimpleDERReader
@@ -31,12 +32,25 @@ class KeystoreSignatureProxy(
 
     override fun sign(message: ByteArray, hashAlgorithm: String): ByteArray {
         val derSignature = try {
-            signOnce(message)
-        } catch (_: UserNotAuthenticatedException) {
-            // Validity window expired (or this is the first sign after key
-            // generation). Prompt for biometrics and retry exactly once.
-            authenticator.authenticate()
-            signOnce(message)
+            try {
+                signOnce(message)
+            } catch (_: UserNotAuthenticatedException) {
+                // Validity window expired (or this is the first sign after key
+                // generation). Prompt for biometrics and retry exactly once.
+                authenticator.authenticate()
+                signOnce(message)
+            }
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            // The keystore entry was generated with
+            // setInvalidatedByBiometricEnrollment(true), so enrolling a new
+            // fingerprint permanently invalidates the SSH key. The user must
+            // regenerate it and re-register the public key on the server;
+            // surface that as an actionable message instead of a raw crash.
+            throw BiometricAuthenticationException(
+                "SSH key was invalidated by a new biometric enrollment. " +
+                    "Generate a new key in the app and add its public key to the server.",
+                e,
+            )
         }
         return encodeSshEcdsaSignature(derSignature)
     }
