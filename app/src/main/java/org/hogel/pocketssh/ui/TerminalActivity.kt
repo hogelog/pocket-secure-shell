@@ -411,7 +411,11 @@ class TerminalActivity : AppCompatActivity() {
     private val controlListener = object : SshConnectionService.TmuxControlListener {
         override fun onPaneOutput(paneId: String, bytes: ByteArray) {
             paneManager?.onOutput(paneId, bytes)
-            detectPasswordPrompt(bytes)
+            // Only the viewed pane drives secure-input detection. recentOutputTail
+            // is a single shared buffer, so scanning background panes would both
+            // misfire on their `password:` lines and interleave bytes from
+            // concurrent panes into a meaningless tail.
+            if (paneId == paneManager?.activePaneId) detectPasswordPrompt(bytes)
         }
 
         override fun onCaptureReply(paneId: String, body: ByteArray) {
@@ -537,7 +541,12 @@ class TerminalActivity : AppCompatActivity() {
                     binding.terminalView,
                     sessionClient,
                     { svc.requestPaneCapture(it) },
-                    { svc.setInputPane(it) },
+                    { paneId ->
+                        svc.setInputPane(paneId)
+                        // Switching panes: drop the old pane's tail so a
+                        // password-prompt match can't span the two panes' bytes.
+                        recentOutputTail.reset()
+                    },
                 )
                 svc.attachControlListener(controlListener)
                 // Cold attach gets the window list via %session-changed; a
