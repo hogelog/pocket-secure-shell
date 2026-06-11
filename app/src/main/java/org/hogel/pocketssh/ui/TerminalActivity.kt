@@ -82,6 +82,8 @@ import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalViewClient
+import com.termux.view.abortFling
+import com.termux.view.flingScrollback
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -302,6 +304,10 @@ class TerminalActivity : AppCompatActivity() {
     // its own `doScroll` doesn't emit a duplicate mouse/arrow sequence to the
     // dummy pty (which the kernel then echoes back into the screen buffer).
     private var handlingScrollGesture = false
+    // Set when our onFling started a row-unit scrollback fling; the UP is
+    // then consumed (and replayed as CANCEL) so TerminalView's own
+    // pixel-velocity fling never also fires.
+    private var nativeFlingClaimed = false
     // Set by the detector's onSingleTapUp when the gesture resolved as a tap
     // (not a scroll / long-press). Consulted at ACTION_UP to decide whether to
     // swallow the up-event and run our own keyboard toggle.
@@ -1721,12 +1727,37 @@ class TerminalActivity : AppCompatActivity() {
     private fun setupTerminalScrollRouting() {
         val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean {
+                // A new touch grabs the transcript immediately instead of
+                // fighting a still-running fling animation.
+                abortFling(binding.terminalView)
                 scrollRemainderPx = 0f
                 handlingScrollGesture = false
+                nativeFlingClaimed = false
                 tappedThisGesture = false
                 gestureAxis = GestureAxis.UNDETERMINED
                 pendingSwipeDirection = 0
                 return false
+            }
+
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float,
+            ): Boolean {
+                // Only the native scrollback path (case 3): mouse/dpad routing
+                // and horizontal swipes have no inertia to begin with.
+                if (gestureAxis != GestureAxis.VERTICAL || handlingScrollGesture) return false
+                val emu = binding.terminalView.mEmulator ?: return false
+                if (emu.isMouseTrackingActive || emu.isAlternateBufferActive) return false
+                // TerminalView's own onFling feeds the pixel velocity (x0.25)
+                // into a row-unit Scroller — roughly 10x the finger speed.
+                // Claim the gesture and fling in row units instead; the UP is
+                // then replayed to TerminalView as CANCEL so its fling never
+                // starts.
+                flingScrollback(binding.terminalView, velocityY)
+                nativeFlingClaimed = true
+                return true
             }
 
             override fun onSingleTapUp(e: MotionEvent): Boolean {
@@ -1849,7 +1880,7 @@ class TerminalActivity : AppCompatActivity() {
             detector.onTouchEvent(event)
             val inMouseTracking = binding.terminalView.mEmulator?.isMouseTrackingActive == true
             val tapInMouseTracking = tappedThisGesture && inMouseTracking
-            var consume = handlingScrollGesture || tapInMouseTracking
+            var consume = handlingScrollGesture || tapInMouseTracking || nativeFlingClaimed
             when (event.action) {
                 MotionEvent.ACTION_UP -> {
                     // Tapped a URL? Open it (with confirmation) instead of
@@ -1878,6 +1909,7 @@ class TerminalActivity : AppCompatActivity() {
                     }
                     hideSwipeFeedback()
                     handlingScrollGesture = false
+                    nativeFlingClaimed = false
                     tappedThisGesture = false
                     gestureAxis = GestureAxis.UNDETERMINED
                     pendingSwipeDirection = 0
@@ -1885,6 +1917,7 @@ class TerminalActivity : AppCompatActivity() {
                 MotionEvent.ACTION_CANCEL -> {
                     hideSwipeFeedback()
                     handlingScrollGesture = false
+                    nativeFlingClaimed = false
                     tappedThisGesture = false
                     gestureAxis = GestureAxis.UNDETERMINED
                     pendingSwipeDirection = 0
