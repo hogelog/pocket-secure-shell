@@ -36,7 +36,12 @@ class SshSession(
     /** Blocking; call from a background thread. */
     fun connect() {
         val conn = Connection(host, port)
-        conn.connect(hostKeyVerifier, 10_000, 10_000)
+        // kexTimeout = 0 disables the key-exchange watchdog. On a first
+        // connection the TOFU verifier blocks the kex on the receiver thread
+        // while the user confirms the host key fingerprint in a dialog; a
+        // bounded kexTimeout would abort the handshake (and leave a half-stored
+        // key) if they take too long. The TCP connect still has its own timeout.
+        conn.connect(hostKeyVerifier, CONNECT_TIMEOUT_MS, NO_KEX_TIMEOUT)
 
         val authenticated = conn.authenticateWithPublicKey(username, signatureProxy)
         if (!authenticated) {
@@ -289,6 +294,8 @@ class SshSession(
 
     companion object {
         private const val TAG = "SshSession"
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val NO_KEX_TIMEOUT = 0
         private const val TMUX_SESSION_NAME = "pocketssh"
         private const val UPLOAD_CHUNK_BYTES = 128 * 1024
     }
