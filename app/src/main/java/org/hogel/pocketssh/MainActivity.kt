@@ -391,8 +391,6 @@ class MainActivity : AppCompatActivity() {
         prefs.getString(KEY_PORT, null)?.let { binding.editPort.setText(it) }
         prefs.getString(KEY_USERNAME, null)?.let { binding.editUsername.setText(it) }
         binding.switchUseTmux.isChecked = prefs.getBoolean(KEY_USE_TMUX, true)
-        // Control-mode toggle is a debug-only experiment; hidden in release.
-        binding.switchControlMode.visibility = if (BuildConfig.DEBUG) View.VISIBLE else View.GONE
         binding.switchControlMode.isChecked = prefs.getBoolean(KEY_TMUX_CONTROL_MODE, false)
         tmuxPrefix = normalizeTmuxPrefix(prefs.getString(KEY_TMUX_PREFIX, DEFAULT_TMUX_PREFIX))
     }
@@ -493,6 +491,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyTmuxExpanded(expanded: Boolean) {
         binding.containerTmux.visibility = if (expanded) View.VISIBLE else View.GONE
+        // Control-mode toggle is a debug-only experiment (hidden in release);
+        // it belongs to the tmux section, so it collapses along with it.
+        binding.switchControlMode.visibility =
+            if (expanded && BuildConfig.DEBUG) View.VISIBLE else View.GONE
         binding.textTmuxSummary.visibility = if (expanded) View.GONE else View.VISIBLE
         binding.iconTmuxChevron.rotation = if (expanded) 180f else 0f
         if (!expanded) {
