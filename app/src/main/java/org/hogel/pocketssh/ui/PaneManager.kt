@@ -28,6 +28,12 @@ class PaneManager(
     private class Pane(val session: TerminalSession) {
         var seeded = false
         val pending = ArrayDeque<ByteArray>()
+        var pendingBytes = 0
+        // Set when the pending buffer overflowed before the capture reply
+        // landed: the buffered live output was flushed to keep the pane usable,
+        // so a late capture reply must be dropped rather than re-prepended,
+        // which would duplicate the screen.
+        var seedAbandoned = false
     }
 
     private val panes = LinkedHashMap<String, Pane>()
@@ -41,8 +47,20 @@ class PaneManager(
         if (activePaneId == null) setActive(paneId)
         if (pane.seeded) {
             appendToPane(pane, bytes)
-        } else {
-            pane.pending.addLast(bytes)
+            return
+        }
+        pane.pending.addLast(bytes)
+        pane.pendingBytes += bytes.size
+        // If the capture reply is lost or badly delayed, the pending buffer
+        // would grow without bound. Once it crosses the cap, give up on
+        // seeding history: flush what we have so live output keeps flowing,
+        // mark the pane seeded, and remember to drop the late capture reply.
+        if (pane.pendingBytes > MAX_PENDING_BYTES) {
+            pane.pending.forEach { appendToPane(pane, it) }
+            pane.pending.clear()
+            pane.pendingBytes = 0
+            pane.seeded = true
+            pane.seedAbandoned = true
         }
     }
 
@@ -50,9 +68,14 @@ class PaneManager(
      *  bytes buffered during the round-trip, in that order. */
     fun onCaptureReply(paneId: String, body: ByteArray) {
         val pane = panes[paneId] ?: return
+        // The seed was already abandoned (pending overflowed and was flushed),
+        // so the live output is on screen; prepending history now would
+        // duplicate it. Drop this late reply.
+        if (pane.seedAbandoned) return
         appendToPane(pane, body)
         pane.pending.forEach { appendToPane(pane, it) }
         pane.pending.clear()
+        pane.pendingBytes = 0
         pane.seeded = true
     }
 
@@ -107,5 +130,11 @@ class PaneManager(
         private const val DEFAULT_COLUMNS = 80
         private const val DEFAULT_ROWS = 24
         private const val TRANSCRIPT_ROWS = 2000
+
+        // Cap on live %output buffered per pane while waiting for its
+        // capture-pane seed. A seed normally lands within one round-trip, so
+        // this only trips when a reply is lost or stalled; 256 KB is far more
+        // than a screen's worth yet bounds worst-case memory if it never comes.
+        private const val MAX_PENDING_BYTES = 256 * 1024
     }
 }
