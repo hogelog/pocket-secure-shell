@@ -786,6 +786,11 @@ class TerminalActivity : AppCompatActivity() {
         lastControlWindows = windows
         val container = binding.windowTabs
         container.removeAllViews()
+        // Control mode appends its own dynamic "+" tab (wired to newWindow())
+        // below. The static layout "+" must stay hidden here — its tap goes
+        // through openNewTmuxWindow()/writeToSsh, which control mode wraps as
+        // send-keys into the active pane instead of creating a window.
+        binding.windowTabsNew.visibility = View.GONE
         binding.windowTabsBar.visibility = if (windows.isNotEmpty()) View.VISIBLE else View.GONE
         if (windows.isEmpty()) return
         val tabHorizontalPaddingPx = dpToPx(6)
