@@ -159,8 +159,8 @@ class TmuxControlClientTest {
         val cmd = String(client.refreshClientSize(52, 38), Charsets.US_ASCII)
         assertEquals("refresh-client -C 52x38\n", cmd)
         client.requestCapture("%1")
-        feed("%begin 1 1 0\n%end 1 1 0\n") // refresh-client reply: dropped
-        feed("%begin 1 2 0\nhi\n%end 1 2 0\n") // capture reply still routes
+        feed("%begin 1 1 1\n%end 1 1 1\n") // refresh-client reply (flags 1): dropped
+        feed("%begin 1 2 1\nhi\n%end 1 2 1\n") // capture reply still routes
         assertEquals("%1", captures.single().first)
     }
 
@@ -175,10 +175,10 @@ class TmuxControlClientTest {
     @Test
     fun `capture reply body routes to the requesting pane joined by CRLF`() {
         client.requestCapture("%2")
-        feed("%begin 1 5 0\n")
+        feed("%begin 1 5 1\n")
         feed("line one\n")
         feed("line two\n")
-        feed("%end 1 5 0\n")
+        feed("%end 1 5 1\n")
         assertEquals("%2", captures.single().first)
         assertArrayEquals("line one\r\nline two".toByteArray(), captures.single().second)
     }
@@ -203,11 +203,11 @@ class TmuxControlClientTest {
     @Test
     fun `a body line that looks like a terminator does not close on a mismatched number`() {
         client.requestCapture("%0")
-        feed("%begin 1 7 0\n")
-        feed("%end 1 99 0\n") // captured content, not the terminator (number != 7)
+        feed("%begin 1 7 1\n")
+        feed("%end 1 99 1\n") // captured content, not the terminator (number != 7)
         feed("real\n")
-        feed("%end 1 7 0\n")
-        assertArrayEquals("%end 1 99 0\r\nreal".toByteArray(), captures.single().second)
+        feed("%end 1 7 1\n")
+        assertArrayEquals("%end 1 99 1\r\nreal".toByteArray(), captures.single().second)
     }
 
     @Test
@@ -219,11 +219,45 @@ class TmuxControlClientTest {
     }
 
     @Test
+    fun `a spontaneous flags-0 block does not steal a pending capture reply`() {
+        client.requestCapture("%1")
+        // A server-spontaneous block (flags 0) arrives before our reply. Under
+        // pure-FIFO matching it would consume the capture entry and the real
+        // reply would then be misrouted forever; flags-gating drops it instead.
+        feed("%begin 100 50 0\n")
+        feed("noise\n")
+        feed("%end 100 50 0\n")
+        assertTrue(captures.isEmpty())
+        // The capture reply (flags 1) still routes to %1.
+        feed("%begin 100 51 1\n")
+        feed("history\n")
+        feed("%end 100 51 1\n")
+        assertEquals("%1", captures.single().first)
+        assertArrayEquals("history".toByteArray(), captures.single().second)
+    }
+
+    @Test
+    fun `a spontaneous block mid-stream keeps later replies aligned`() {
+        // Two client commands in flight; a spontaneous block lands between their
+        // replies. Each client reply must still pair with its own command.
+        client.requestCapture("%1")
+        client.requestCapture("%2")
+        feed("%begin 1 1 1\nfirst\n%end 1 1 1\n") // -> %1
+        feed("%begin 1 2 0\nspurious\n%end 1 2 0\n") // out-of-band, dropped
+        feed("%begin 1 3 1\nsecond\n%end 1 3 1\n") // -> %2
+        assertEquals(2, captures.size)
+        assertEquals("%1", captures[0].first)
+        assertArrayEquals("first".toByteArray(), captures[0].second)
+        assertEquals("%2", captures[1].first)
+        assertArrayEquals("second".toByteArray(), captures[1].second)
+    }
+
+    @Test
     fun `replies are consumed in send order before the capture reply`() {
         client.encodeInput("ab".toByteArray()) // enqueues one send-keys command
         client.requestCapture("%1")
-        feed("%begin 1 1 0\n%end 1 1 0\n") // send-keys reply: body dropped
-        feed("%begin 1 2 0\nhi\n%end 1 2 0\n") // capture reply
+        feed("%begin 1 1 1\n%end 1 1 1\n") // send-keys reply: body dropped
+        feed("%begin 1 2 1\nhi\n%end 1 2 1\n") // capture reply
         assertEquals("%1", captures.single().first)
         assertArrayEquals("hi".toByteArray(), captures.single().second)
     }
@@ -233,10 +267,10 @@ class TmuxControlClientTest {
     @Test
     fun `list-windows reply is parsed into windows`() {
         client.requestWindows()
-        feed("%begin 1 9 0\n")
+        feed("%begin 1 9 1\n")
         feed("@0\t0\tbash\t0\t%0\tbash\n")
         feed("@13\t4\tclaude\t1\t%19\tnode\n")
-        feed("%end 1 9 0\n")
+        feed("%end 1 9 1\n")
         val windows = windowsUpdates.single()
         assertEquals(2, windows.size)
         assertEquals(TmuxControlWindow("@13", 4, "claude", true, "%19", "node"), windows[1])

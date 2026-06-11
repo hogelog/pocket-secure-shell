@@ -18,10 +18,12 @@ data class TmuxControlWindow(
  *
  * tmux emits a line-based protocol on stdout. The lines we act on:
  *
- *   `%begin <ts> <num> <flags>` … `%end`/`%error` — a command reply block. The
- *       body belongs to the command the client sent (see [pendingCommands]):
- *       a `capture-pane` body goes to [onCaptureReply], a `list-windows` body is
- *       parsed and sent to [onWindowsChanged]; other replies are dropped.
+ *   `%begin <ts> <num> <flags>` … `%end`/`%error` — a command reply block. When
+ *       `flags` is 1 the block answers a command the client queued (see
+ *       [pendingCommands]): a `capture-pane` body goes to [onCaptureReply], a
+ *       `list-windows` body is parsed and sent to [onWindowsChanged]; other
+ *       replies are dropped. `flags` 0 marks a server-spontaneous block, dropped
+ *       without consuming the FIFO.
  *   `%output %<pane> <payload>` — pane output. tmux octal-escapes bytes `< 0x20`
  *       and backslash; [decodeOutput] reverses it to the exact original bytes.
  *   `%exit [reason]` — tmux is detaching or exiting.
@@ -47,8 +49,10 @@ class TmuxControlClient(
     private val lineBuffer = ByteArrayOutputStream()
 
     /** FIFO of the commands the client has sent, one entry per command, used to
-     *  identify each `%begin` reply block. A `%begin` whose queue entry is
-     *  missing (tmux's attach-time blocks) is out-of-band and its body dropped.
+     *  identify each `%begin` reply block. Only consumed for blocks whose
+     *  `%begin` flags mark them as client-command replies (see [handleLine]);
+     *  server-spontaneous blocks (flags 0) never touch it, so a single stray
+     *  out-of-band block can no longer shift the queue permanently out of step.
      *  Touched on both the read and write threads. */
     private val pendingCommands = ArrayDeque<Pending>()
 
@@ -85,7 +89,15 @@ class TmuxControlClient(
             line.startsWith("%begin") -> {
                 inReplyBlock = true
                 replyNum = line.numberField()
-                currentCommand = dequeueCommand()
+                // tmux prints `%begin <ts> <num> <flags>` with flags = 1 only for
+                // replies to commands the control client itself queued, and 0 for
+                // server-spontaneous blocks (hooks, the attach-time blocks). Match
+                // a queued command only for flags == 1; drop flags == 0 blocks as
+                // out-of-band without consuming the FIFO, so a stray spontaneous
+                // block can't desync command↔reply pairing for the rest of the
+                // session. (tmux cmdq_guard: flags = !!(state & CMDQ_STATE_CONTROL),
+                // stable across tmux 3.1–3.5.)
+                currentCommand = if (line.flagsField() == "1") dequeueCommand() else null
                 replyBody.reset()
             }
             line.startsWith("%output ") -> handleOutput(line)
@@ -141,6 +153,9 @@ class TmuxControlClient(
 
     /** The `<num>` token of `%begin`/`%end`/`%error` (`%begin <ts> <num> …`). */
     private fun String.numberField(): String? = split(' ').getOrNull(2)
+
+    /** The `<flags>` token of `%begin` (`%begin <ts> <num> <flags>`). */
+    private fun String.flagsField(): String? = split(' ').getOrNull(3)
 
     /** `%output %<pane> <payload>` */
     private fun handleOutput(line: String) {
