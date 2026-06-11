@@ -18,6 +18,21 @@ fun abortFling(view: TerminalView) {
     view.mScroller.forceFinished(true)
 }
 
+/**
+ * Snap the view back to the live screen. The vendor view only resets
+ * [TerminalView.mTopRow] in onScreenUpdated / its own key paths, neither of
+ * which run here (output is appended straight to the emulator, input goes out
+ * over SSH) — so without this, a scrolled-back view never returns to the
+ * bottom and anything echoed for new keystrokes renders below the viewport.
+ */
+fun scrollToBottom(view: TerminalView) {
+    view.mScroller.forceFinished(true)
+    if (view.mTopRow != 0) {
+        view.mTopRow = 0
+        view.invalidate()
+    }
+}
+
 /** Start a scrollback fling from [velocityY] (pixels/second, GestureDetector sign). */
 fun flingScrollback(view: TerminalView, velocityY: Float) {
     if (view.mEmulator == null) return

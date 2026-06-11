@@ -84,6 +84,7 @@ import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalViewClient
 import com.termux.view.abortFling
 import com.termux.view.flingScrollback
+import com.termux.view.scrollToBottom
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -907,6 +908,7 @@ class TerminalActivity : AppCompatActivity() {
             runShortcutAction("\\r")
         } else {
             {
+                scrollToBottom(binding.terminalView)
                 service?.writeToSsh("$token ".toByteArray(Charsets.UTF_8))
                 bigramTracker.commitToken(token)
             }
@@ -2062,6 +2064,10 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private fun writeToSsh(data: ByteArray) {
+        // Typing while scrolled back snaps the view to the live screen, the
+        // way a desktop terminal does — otherwise whatever the remote echoes
+        // for these bytes renders below the viewport and looks like lost input.
+        scrollToBottom(binding.terminalView)
         service?.writeToSsh(data)
         if (secureInputActive) {
             // Bytes during secure input are deliberately kept out of the
