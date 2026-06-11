@@ -91,6 +91,12 @@ class SshConnectionService : Service() {
     private var session: SshSession? = null
     private var readThread: Thread? = null
 
+    // Set when shutdown() is requested so the connect worker does not start a
+    // TOFU retry (see [runReadLoop]) after the user has already torn the
+    // connection down.
+    @Volatile
+    private var shuttingDown: Boolean = false
+
     @Volatile
     var connectionLabel: String = ""
         private set
@@ -207,6 +213,7 @@ class SshConnectionService : Service() {
         synchronized(this) {
             if (state == State.CONNECTING || state == State.CONNECTED) return
             state = State.CONNECTING
+            shuttingDown = false
             lastError = null
             connectionLabel = "${params.username}@${params.host}:${params.port}"
             useTmux = params.useTmux
@@ -234,28 +241,37 @@ class SshConnectionService : Service() {
         rows: Int,
     ) {
         var caught: Throwable? = null
+        // Held outside the try so the finally can disconnect a connection that
+        // was opened but never published to [session] (e.g. openShell threw
+        // after connect succeeded). Without this the live Connection and its
+        // trilead receiver thread would leak on every failed retry.
+        var ssh: SshSession? = null
         try {
             val keyManager = SshKeyManager()
             val publicKey = keyManager.loadPublicKey()
                 ?: throw SshAuthenticationException("No SSH key found")
             val signatureProxy = KeystoreSignatureProxy(publicKey, keyManager, authenticator)
-            val hostKeyVerifier = TofuHostKeyVerifier(HostKeyStore(this), hostKeyPrompt)
-            val ssh = SshSession(
-                params.host,
-                params.port,
-                params.username,
-                signatureProxy,
-                hostKeyVerifier,
-            )
-            ssh.connect()
+            // Publish each attempt's session to both the worker-local [ssh]
+            // (for the finally's disconnect) and the [session] field (the
+            // line read by writeToSsh/resizeWindow/shutdown/SCP/probeLiveness)
+            // before its blocking handshake, so a shutdown() during CONNECTING
+            // can reach it (PR #232) and so input/teardown is not a no-op once
+            // connected. On a retry the old session is disconnected first, then
+            // this overwrites both with the fresh one.
+            val connected = connectWithTofuRetry(params, signatureProxy, hostKeyPrompt) {
+                ssh = it
+                session = it
+            }
             trace { "ssh connected, opening shell" }
-            ssh.openShell(
+            connected.openShell(
                 columns.coerceAtLeast(1),
                 rows.coerceAtLeast(1),
                 params.useTmux,
                 useTmuxControlMode,
             )
-            session = ssh
+            // [session] is already published by connectWithTofuRetry's onSession
+            // callback (to the final, post-retry session). The control client is
+            // bound to that same session's command channel here.
             controlClient = if (useTmuxControlMode) {
                 TmuxControlClient(
                     onPaneOutput = { pane, bytes ->
@@ -279,11 +295,13 @@ class SshConnectionService : Service() {
             lastConnectedAt = System.currentTimeMillis()
             trace { "state -> CONNECTED" }
             updateNotification(getString(R.string.notification_text_connected, connectionLabel))
-            startKeepalive(ssh)
+            startKeepalive(connected)
             notifyStatus { it.onSshConnected() }
 
             val buffer = ByteArray(8192)
-            val input = ssh.stdout
+            // Use the final, post-retry session ([connected]) for stdout, not the
+            // worker-local [ssh] which may point at a discarded first attempt.
+            val input = connected.stdout
             val control = controlClient
             // The window list is requested on %session-changed (see the control
             // client), not here, so a spontaneous attach-time %begin can't steal
@@ -318,7 +336,11 @@ class SshConnectionService : Service() {
             // so state teardown and onSshDisconnected fire immediately —
             // otherwise the service looks alive (state CONNECTED, session
             // non-null) while every write fails with "channel is closed".
-            val dying = session
+            // Use the worker-local [ssh], not the [session] field: on an
+            // openShell failure the field is still null but the connection is
+            // already live, and only [ssh] holds it. After a successful
+            // connect the two reference the same instance.
+            val dying = ssh
             Thread({ runCatching { dying?.disconnect() } }, "ssh-shutdown-finally")
                 .apply { isDaemon = true }
                 .start()
@@ -330,6 +352,63 @@ class SshConnectionService : Service() {
             notifyStatus { it.onSshDisconnected(caught) }
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
+        }
+    }
+
+    /**
+     * Connect, recovering from a TOFU host-key dialog that outlasted the
+     * kexTimeout watchdog.
+     *
+     * On a first connection the [TofuHostKeyVerifier] blocks the key exchange on
+     * the trilead receiver thread while the user confirms the host key. If they
+     * take longer than the kexTimeout the watchdog aborts the handshake with a
+     * [java.net.SocketTimeoutException] — but the verifier still persists the key
+     * the moment they accept, even on the dead handshake. So when connect() times
+     * out and the host key appeared during the attempt (it was absent before and
+     * is present now), the user did accept: retry once on a fresh session, which
+     * now finds the key trusted and completes without prompting.
+     *
+     * Any other failure — a genuinely unresponsive peer (store unchanged), a
+     * rejected key, or a shutdown requested meanwhile — propagates as before; the
+     * retry never loops.
+     *
+     * Each attempt's session is handed to [onSession] before its blocking
+     * handshake so a concurrent [shutdown] can reach and abort it, and so the
+     * read loop's finally can disconnect a connection that was opened but never
+     * reached [openShell].
+     */
+    private fun connectWithTofuRetry(
+        params: ConnectionParams,
+        signatureProxy: KeystoreSignatureProxy,
+        hostKeyPrompt: HostKeyPrompt,
+        onSession: (SshSession) -> Unit,
+    ): SshSession {
+        val hostKeyStore = HostKeyStore(this)
+        fun newSession(): SshSession =
+            SshSession(
+                params.host,
+                params.port,
+                params.username,
+                signatureProxy,
+                TofuHostKeyVerifier(hostKeyStore, hostKeyPrompt),
+            ).also(onSession)
+
+        val hadKeyBefore = hostKeyStore.get(params.host, params.port) != null
+        val first = newSession()
+        try {
+            first.connect()
+            return first
+        } catch (e: java.net.SocketTimeoutException) {
+            val keyJustTrusted = !hadKeyBefore &&
+                hostKeyStore.get(params.host, params.port) != null
+            if (!keyJustTrusted || shuttingDown) throw e
+            trace { "kex timeout but host key just trusted; retrying once" }
+            // Release the timed-out connection (and its trilead receiver thread)
+            // before opening a fresh one for the retry.
+            runCatching { first.disconnect() }
+            val retry = newSession()
+            retry.connect()
+            return retry
         }
     }
 
@@ -385,21 +464,29 @@ class SshConnectionService : Service() {
      * either.
      */
     fun attachOutputListener(listener: (ByteArray) -> Unit) {
-        val backlog: ByteArray?
+        val backlogSize: Int
+        // Hold the lock across both the listener install and the backlog
+        // posts. `mainHandler.post` is non-blocking, so the lock is held only
+        // long enough to enqueue the chunks — but that window is enough to
+        // keep any concurrent `deliverOutput` from posting newer bytes
+        // between two backlog chunks, which would replay out of order. The
+        // backlog is still split into [BACKLOG_REPLAY_CHUNK_BYTES] posts so
+        // the UI thread can interleave input events between chunks.
         synchronized(outputLock) {
-            backlog = if (outputHistory.size() > 0) outputHistory.toByteArray() else null
+            val backlog = if (outputHistory.size() > 0) outputHistory.toByteArray() else null
+            backlogSize = backlog?.size ?: 0
+            backlog?.let { full ->
+                var offset = 0
+                while (offset < full.size) {
+                    val end = minOf(offset + BACKLOG_REPLAY_CHUNK_BYTES, full.size)
+                    val chunk = full.copyOfRange(offset, end)
+                    mainHandler.post { listener(chunk) }
+                    offset = end
+                }
+            }
             outputListener = listener
         }
-        trace { "attachOutputListener backlog=${backlog?.size ?: 0}" }
-        backlog?.let { full ->
-            var offset = 0
-            while (offset < full.size) {
-                val end = minOf(offset + BACKLOG_REPLAY_CHUNK_BYTES, full.size)
-                val chunk = full.copyOfRange(offset, end)
-                mainHandler.post { listener(chunk) }
-                offset = end
-            }
-        }
+        trace { "attachOutputListener backlog=$backlogSize" }
     }
 
     fun detachOutputListener() {
@@ -517,6 +604,9 @@ class SshConnectionService : Service() {
     }
 
     fun writeToSsh(data: ByteArray) {
+        // The session is published before the shell channel exists (during
+        // CONNECTING), so gate on CONNECTED before touching stdin.
+        if (state != State.CONNECTED) return
         val out = session?.stdin ?: return
         // In control mode stdin is the command channel, so input must be wrapped
         // as `send-keys` rather than written as raw bytes.
@@ -716,6 +806,9 @@ class SshConnectionService : Service() {
 
     /** Tear down the SSH connection; the service will stop itself. */
     fun shutdown() {
+        // Block any in-flight TOFU retry in the connect worker (see
+        // [runReadLoop]) from reconnecting after this teardown.
+        shuttingDown = true
         // disconnect() sends an SSH-level message and must not run on the
         // main thread. Use a dedicated thread so a stuck writer can't delay
         // the teardown. The read loop will then exit and run its finally.

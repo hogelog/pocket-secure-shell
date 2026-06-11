@@ -35,16 +35,45 @@ class SshSession(
 
     /** Blocking; call from a background thread. */
     fun connect() {
+        // Publish the Connection before the blocking handshake so a concurrent
+        // [disconnect] (e.g. the user aborting while still CONNECTING) can close
+        // it. Connection.close() is synchronized on the same monitor as
+        // connect()/authenticate, so it cannot interrupt the KEX or auth read
+        // itself — only the kexTimeout watchdog (which closes the underlying
+        // TransportManager off-monitor) can abort a stalled handshake. So the
+        // handshake is bounded solely by the connect/kex timeouts below; close()
+        // only aborts the (unsynchronized) shell-open phase and any post-auth
+        // wait.
         val conn = Connection(host, port)
-        conn.connect(hostKeyVerifier, 10_000, 10_000)
+        connection = conn
+        // kexTimeout bounds the key-exchange watchdog: a peer that accepts the
+        // TCP connection but stalls the SSH handshake (dying sshd, tarpit, wrong
+        // port, link dropping mid-kex) is aborted with a SocketTimeoutException
+        // instead of blocking connect() forever. On a first connection the TOFU
+        // verifier also blocks the kex on the receiver thread while the user
+        // confirms the host key in a dialog; the timeout is kept generous so an
+        // attentive user clears it in time, and if they exceed it the verifier
+        // still persists the key on accept, so SshConnectionService retries the
+        // connection once (now silent, key already trusted) to recover.
+        conn.connect(hostKeyVerifier, CONNECT_TIMEOUT_MS, KEX_TIMEOUT_MS)
 
-        val authenticated = conn.authenticateWithPublicKey(username, signatureProxy)
+        val authenticated = try {
+            conn.authenticateWithPublicKey(username, signatureProxy)
+        } catch (e: Throwable) {
+            // authenticateWithPublicKey can throw (e.g. a cancelled biometric
+            // surfaces as an IOException from SignatureProxy.sign). Close the
+            // live connection before propagating so it does not leak. conn is
+            // also published to [connection], so the read-loop finally's
+            // disconnect() may close it again; the second close is a harmless
+            // no-op (and disconnect() swallows exceptions anyway).
+            conn.close()
+            throw e
+        }
         if (!authenticated) {
             conn.close()
             throw SshAuthenticationException("Public key authentication failed")
         }
 
-        connection = conn
         isConnected = true
     }
 
@@ -298,6 +327,11 @@ class SshSession(
 
     companion object {
         private const val TAG = "SshSession"
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        // Generous enough for an attentive user to confirm a TOFU host-key
+        // dialog before the key-exchange watchdog fires; a real unresponsive
+        // peer is still aborted within this window.
+        private const val KEX_TIMEOUT_MS = 30_000
         private const val TMUX_SESSION_NAME = "pocketssh"
         private const val UPLOAD_CHUNK_BYTES = 128 * 1024
     }

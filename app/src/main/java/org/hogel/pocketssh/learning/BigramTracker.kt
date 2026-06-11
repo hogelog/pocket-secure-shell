@@ -10,7 +10,9 @@ import java.io.ByteArrayOutputStream
  * State machine, byte by byte:
  * - **CR / LF**: line break. If a token is buffered and the line has not been
  *   poisoned, record `(prev, buffer)`. Then reset to `prev = <BOL>`, empty
- *   buffer, un-poison.
+ *   buffer, un-poison. A CRLF pair (CR immediately followed by LF, even across
+ *   chunk boundaries) is a single line break: the LF is swallowed so it does
+ *   not record a second, empty-line terminator.
  * - **space / tab**: token boundary. If a token is buffered and the line has
  *   not been poisoned, record `(prev, buffer)` and adopt that token as the new
  *   `prev`. Empty the buffer either way.
@@ -44,6 +46,15 @@ class BigramTracker(
     private var poisoned: Boolean = false
 
     /**
+     * True iff the immediately preceding byte was a CR (0x0D). Used to swallow
+     * the LF of a CRLF pair as a single line break instead of recording a
+     * spurious `(<BOL>, <ENTER>)` on the empty post-CR line. Kept as a field so
+     * a CRLF split across two [ingestSend] chunks is still treated as one
+     * terminator.
+     */
+    private var prevWasCr: Boolean = false
+
+    /**
      * Switch the foreground context. Empty / null collapses to
      * [BigramStore.UNKNOWN_CONTEXT] so suggestions still flow when tmux is off
      * or has not yet emitted a title OSC.
@@ -69,6 +80,14 @@ class BigramTracker(
         var shouldNotify = false
         for (b in bytes) {
             val v = b.toInt() and 0xFF
+            // Swallow the LF of a CRLF pair (possibly split across chunks): the
+            // CR already terminated the line, so the LF must not be processed
+            // again as a fresh empty-line break.
+            if (v == 0x0A && prevWasCr) {
+                prevWasCr = false
+                continue
+            }
+            prevWasCr = v == 0x0D
             when {
                 v == 0x0A || v == 0x0D -> {
                     val tail = if (!poisoned && buffer.size() > 0) decodeAndReset() else null
@@ -124,6 +143,7 @@ class BigramTracker(
         prev = BigramStore.BOL
         buffer.reset()
         poisoned = false
+        prevWasCr = false
     }
 
     /**
@@ -141,6 +161,7 @@ class BigramTracker(
         if (prev != token) prev = token
         buffer.reset()
         poisoned = false
+        prevWasCr = false
         onPrevChanged()
     }
 

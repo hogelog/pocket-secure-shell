@@ -150,6 +150,16 @@ class TerminalActivity : AppCompatActivity() {
             }
 
             runOnUiThread {
+                // If the activity was destroyed while CONNECTING (back-press, or
+                // a uiMode change the manifest does not handle), showing the
+                // prompt would crash and, worse, never unblock the ssh-read
+                // thread parked on take() below. Reject immediately instead.
+                if (isFinishing || isDestroyed) {
+                    resultQueue.put(Result.failure(
+                        BiometricAuthenticationException("Activity destroyed before biometric prompt"),
+                    ))
+                    return@runOnUiThread
+                }
                 val prompt = BiometricPrompt(
                     this@TerminalActivity,
                     biometricExecutor,
@@ -163,7 +173,15 @@ class TerminalActivity : AppCompatActivity() {
                         androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG,
                     )
                     .build()
-                prompt.authenticate(info)
+                try {
+                    prompt.authenticate(info)
+                } catch (e: Exception) {
+                    // e.g. IllegalStateException from a fragment commit onto a
+                    // torn-down FragmentActivity. Unblock the ssh-read thread.
+                    resultQueue.put(Result.failure(
+                        BiometricAuthenticationException("Failed to show biometric prompt", e),
+                    ))
+                }
             }
 
             resultQueue.take().getOrThrow()
@@ -182,25 +200,51 @@ class TerminalActivity : AppCompatActivity() {
             // is false so a stray back-press cannot silently accept the key.
             val resultQueue = SynchronousQueue<Boolean>()
             runOnUiThread {
-                AlertDialog.Builder(this@TerminalActivity)
-                    .setTitle(R.string.host_key_verify_title)
-                    .setMessage(
-                        getString(
-                            R.string.host_key_verify_message,
-                            host,
-                            port,
-                            algorithm,
-                            fingerprint,
-                        ),
-                    )
-                    .setCancelable(false)
-                    .setPositiveButton(R.string.host_key_accept) { _, _ ->
-                        resultQueue.put(true)
-                    }
-                    .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        resultQueue.put(false)
-                    }
-                    .show()
+                // If the activity was destroyed while CONNECTING (back-press, or
+                // a uiMode change the manifest does not handle), showing the
+                // dialog would throw BadTokenException and never unblock the
+                // ssh-read thread parked on take() below. Reject the key instead.
+                if (isFinishing || isDestroyed) {
+                    resultQueue.put(false)
+                    return@runOnUiThread
+                }
+                try {
+                    val dialog = AlertDialog.Builder(this@TerminalActivity)
+                        .setTitle(R.string.host_key_verify_title)
+                        .setMessage(
+                            getString(
+                                R.string.host_key_verify_message,
+                                host,
+                                port,
+                                algorithm,
+                                fingerprint,
+                            ),
+                        )
+                        .setCancelable(false)
+                        .setPositiveButton(R.string.host_key_accept) { _, _ ->
+                            // Clear the fields first so a destroy racing this
+                            // listener cannot offer a stale result onto a queue
+                            // the receiver has already left.
+                            hostKeyDialog = null
+                            hostKeyResultQueue = null
+                            resultQueue.put(true)
+                        }
+                        .setNegativeButton(android.R.string.cancel) { _, _ ->
+                            hostKeyDialog = null
+                            hostKeyResultQueue = null
+                            resultQueue.put(false)
+                        }
+                        .show()
+                    // Hold the dialog and queue so onDestroy can reject the key
+                    // and unblock the receiver thread if the activity is torn
+                    // down while the dialog is still showing.
+                    hostKeyDialog = dialog
+                    hostKeyResultQueue = resultQueue
+                } catch (e: Exception) {
+                    // e.g. BadTokenException showing onto a torn-down window.
+                    // Unblock the ssh-read thread by rejecting the key.
+                    resultQueue.put(false)
+                }
             }
             return resultQueue.take()
         }
@@ -242,6 +286,15 @@ class TerminalActivity : AppCompatActivity() {
     // and the document picker callback knows where to put the file.
     private var scpBrowserDialog: AlertDialog? = null
     private var scpTransferDialog: AlertDialog? = null
+
+    // Active host-key confirmation dialog and the queue its ssh-read thread is
+    // parked on. Held so onDestroy can reject the pending key and unblock that
+    // thread: a uiMode change (dark-mode auto-switch, split-screen) destroys the
+    // activity while the dialog is showing, which force-closes the window
+    // without firing any button or dismiss listener, so nobody would otherwise
+    // hand a result back to the receiver thread.
+    private var hostKeyDialog: AlertDialog? = null
+    private var hostKeyResultQueue: SynchronousQueue<Boolean>? = null
     private var scpUploadTargetDir: String? = null
     private var scpBrowserListView: ListView? = null
     private var scpBrowserPathHeader: TextView? = null
@@ -541,6 +594,10 @@ class TerminalActivity : AppCompatActivity() {
         binding.windowTabsNew.setOnClickListener { openNewTmuxWindow() }
         binding.fabMain.setOnClickListener { setFabExpanded(!fabExpanded) }
         setFabExpanded(false)
+        binding.btnKeyboard.setOnClickListener {
+            binding.imeProxy.requestFocus()
+            toggleSoftKeyboard()
+        }
         binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
         // Initial sync so the IME proxy / badge visibility match the
         // default-off state on a freshly created activity.
@@ -1117,6 +1174,10 @@ class TerminalActivity : AppCompatActivity() {
     private fun scpNavigate(path: String) {
         val svc = service ?: return
         svc.listRemoteDir(path) { result ->
+            // The callback is posted to the main thread and may arrive after the
+            // Activity is gone (e.g. the connection dropped and we finished while
+            // the listing was in flight). Showing a dialog then crashes.
+            if (isFinishing || isDestroyed) return@listRemoteDir
             result.fold(
                 onSuccess = { showScpListing(it) },
                 onFailure = { e ->
@@ -1253,6 +1314,7 @@ class TerminalActivity : AppCompatActivity() {
         val dialog = buildScpProgressDialog(R.string.scp_copying)
         val future = svc.downloadFile(remotePath, out) { error ->
             if (cancelled.get()) return@downloadFile
+            if (isFinishing || isDestroyed) return@downloadFile
             scpTransferDialog = null
             dialog.dismiss()
             if (error == null) {
@@ -1324,6 +1386,11 @@ class TerminalActivity : AppCompatActivity() {
         val future = svc.downloadFile(remotePath, out) { error ->
             try { out.close() } catch (_: Exception) {}
             if (cancelled.get()) return@downloadFile
+            if (isFinishing || isDestroyed) {
+                // Activity gone before the transfer finished; leave the pending
+                // MediaStore entry for the system to reap rather than touching UI.
+                return@downloadFile
+            }
             scpTransferDialog = null
             dialog.dismiss()
             if (error == null) {
@@ -1718,8 +1785,7 @@ class TerminalActivity : AppCompatActivity() {
      * `TerminalView.onUp` would emit `MOUSE_LEFT_BUTTON` press/release via
      * `emulator.sendMouseEvent`, again echoing through the dummy pty as
      * `^[[<0;x;yM^[[<0;x;ym…`. We swallow the tap-up, then do
-     * `requestFocus()` + `toggleSoftKeyboard()` ourselves so the user's
-     * existing tap-to-toggle-keyboard behavior is preserved.
+     * `requestFocus()` ourselves so the IME proxy stays the IME target.
      *
      * For pinches and for taps in plain-shell mode we leave events untouched.
      */
@@ -1905,7 +1971,6 @@ class TerminalActivity : AppCompatActivity() {
                     if (pendingSwipeDirection != 0) commitPendingSwipe()
                     if (tapInMouseTracking && !openedLink) {
                         binding.imeProxy.requestFocus()
-                        toggleSoftKeyboard()
                     }
                     hideSwipeFeedback()
                     handlingScrollGesture = false
@@ -2165,6 +2230,15 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // Reject a host-key dialog still showing at teardown: force-closing its
+        // window does not fire the button listeners, so the ssh-read thread
+        // parked on take() would hang forever. offer() (not put()) avoids
+        // blocking here — if the receiver already took a value it simply fails
+        // and is harmless.
+        hostKeyResultQueue?.offer(false)
+        hostKeyResultQueue = null
+        hostKeyDialog?.dismiss()
+        hostKeyDialog = null
         scpBrowserDialog?.dismiss()
         scpBrowserDialog = null
         scpTransferDialog?.dismiss()
@@ -2178,8 +2252,13 @@ class TerminalActivity : AppCompatActivity() {
             bound = false
             service = null
         }
-        biometricExecutor.shutdownNow()
         paneManager?.finishAll()
+        // Graceful shutdown (not shutdownNow): if a biometric prompt is being
+        // dismissed by this very teardown, its error callback is already queued
+        // on this executor and must still run so it unblocks the ssh-read thread
+        // parked on the result queue. shutdownNow would drop that task and leave
+        // the connection wedged in CONNECTING forever.
+        biometricExecutor.shutdown()
         binding.terminalView.mTermSession?.finishIfRunning()
         super.onDestroy()
     }
@@ -2245,11 +2324,10 @@ class TerminalActivity : AppCompatActivity() {
             return scale
         }
         override fun onSingleTapUp(e: MotionEvent?) {
-            // Tapping the terminal toggles the soft keyboard so it can be
-            // re-summoned after the user dismisses it with the back gesture.
-            // Focus stays on the IME proxy view (it's the IME target).
+            // Keep focus on the IME proxy view (it's the IME target). The
+            // keyboard itself is summoned via the keyboard button above the
+            // FAB, never by tapping the terminal.
             binding.imeProxy.requestFocus()
-            toggleSoftKeyboard()
         }
         override fun shouldBackButtonBeMappedToEscape(): Boolean = true
         override fun shouldEnforceCharBasedInput(): Boolean = true
