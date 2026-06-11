@@ -10,6 +10,7 @@
     <string name="port">Port</string>
     <string name="username">Username</string>
     <string name="use_tmux">Use tmux session</string>
+    <string name="tmux_control_mode">tmux control mode (experimental)</string>
     <string name="prefix">prefix</string>
     <string name="tmux_prefix">tmux prefix</string>
     <string name="tmux_prefix_dialog_message">Single letter used after Ctrl as your tmux prefix.</string>

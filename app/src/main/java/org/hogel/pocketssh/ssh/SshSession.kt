@@ -92,11 +92,12 @@ class SshSession(
         columns: Int,
         rows: Int,
         useTmux: Boolean = false,
+        controlMode: Boolean = false,
     ) {
         val conn = connection ?: throw IllegalStateException("Not connected")
         val sess = conn.openSession()
         sess.requestPTY("xterm-256color", columns, rows, 0, 0, null)
-        val remoteCommand = buildRemoteCommand(useTmux)
+        val remoteCommand = buildRemoteCommand(useTmux, controlMode)
         if (remoteCommand == null) {
             sess.startShell()
         } else {
@@ -105,8 +106,16 @@ class SshSession(
         session = sess
     }
 
-    private fun buildRemoteCommand(useTmux: Boolean): String? {
+    private fun buildRemoteCommand(useTmux: Boolean, controlMode: Boolean): String? {
         if (!useTmux) return null
+
+        // Control mode (`tmux -CC`) speaks a line protocol on stdout that the
+        // client parses into pane output; the OSC-title window-list config
+        // below is irrelevant there (tmux supplies the window list as control
+        // notifications) so it is omitted.
+        if (controlMode) {
+            return "bash -lc ${shellQuote("tmux -CC new-session -A -s $TMUX_SESSION_NAME")}"
+        }
 
         val inner = buildString {
             // Configure tmux to broadcast the active pane's foreground command

@@ -137,6 +137,7 @@ class DiagDumpActivity : AppCompatActivity() {
             appendLine("state             = ${snap.state}")
             appendLine("connectionLabel   = ${snap.connectionLabel}")
             appendLine("useTmux           = ${snap.useTmux}")
+            appendLine("tmuxControlMode   = ${snap.useTmuxControlMode}")
             appendLine("lastTitle         = ${snap.lastTitle ?: "(none)"}")
             appendLine("lastError         = ${formatError(snap.lastError)}")
             appendLine("outputBufferBytes = ${snap.outputBufferBytes}")
@@ -146,6 +147,9 @@ class DiagDumpActivity : AppCompatActivity() {
             appendLine("lastReadAt        = ${formatAge(snap.lastReadAt, now)}")
             appendLine("totalReadBytes    = ${snap.totalReadBytes}")
             appendLine("lastKeepaliveAt   = ${formatAge(snap.lastKeepaliveAt, now)}")
+            appendLine("paneOutputCount   = ${snap.paneOutputCount}")
+            appendLine("capturesSent      = ${snap.capturesSent}")
+            appendLine("captureReplies    = ${snap.captureRepliesReceived}")
         }
         appendLine()
 

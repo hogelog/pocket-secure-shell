@@ -74,6 +74,7 @@ import org.hogel.pocketssh.ssh.HostKeyPrompt
 import org.hogel.pocketssh.ssh.RemoteListing
 import org.hogel.pocketssh.ssh.SshConnectionService
 import org.hogel.pocketssh.ssh.SshKeyManager
+import org.hogel.pocketssh.tmux.TmuxControlWindow
 import org.hogel.pocketssh.tmux.TmuxTitle
 import org.hogel.pocketssh.tmux.TmuxWindow
 import com.termux.terminal.KeyHandler
@@ -81,6 +82,9 @@ import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalViewClient
+import com.termux.view.abortFling
+import com.termux.view.flingScrollback
+import com.termux.view.scrollToBottom
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -354,6 +358,10 @@ class TerminalActivity : AppCompatActivity() {
     // its own `doScroll` doesn't emit a duplicate mouse/arrow sequence to the
     // dummy pty (which the kernel then echoes back into the screen buffer).
     private var handlingScrollGesture = false
+    // Set when our onFling started a row-unit scrollback fling; the UP is
+    // then consumed (and replayed as CANCEL) so TerminalView's own
+    // pixel-velocity fling never also fires.
+    private var nativeFlingClaimed = false
     // Set by the detector's onSingleTapUp when the gesture resolved as a tap
     // (not a scroll / long-press). Consulted at ACTION_UP to decide whether to
     // swallow the up-event and run our own keyboard toggle.
@@ -398,6 +406,32 @@ class TerminalActivity : AppCompatActivity() {
     ) { uri -> if (uri != null) onScpUploadFilePicked(uri) }
 
     private val outputListener: (ByteArray) -> Unit = ::handleSshOutput
+
+    private var paneManager: PaneManager? = null
+
+    private val controlListener = object : SshConnectionService.TmuxControlListener {
+        override fun onPaneOutput(paneId: String, bytes: ByteArray) {
+            paneManager?.onOutput(paneId, bytes)
+            // Only the viewed pane drives secure-input detection. recentOutputTail
+            // is a single shared buffer, so scanning background panes would both
+            // misfire on their `password:` lines and interleave bytes from
+            // concurrent panes into a meaningless tail.
+            if (paneId == paneManager?.activePaneId) detectPasswordPrompt(bytes)
+        }
+
+        override fun onCaptureReply(paneId: String, body: ByteArray) {
+            paneManager?.onCaptureReply(paneId, body)
+        }
+
+        override fun onWindowsChanged(windows: List<TmuxControlWindow>) {
+            paneManager?.setWindows(windows)
+            applyControlWindows(windows)
+            // Drive the per-app shortcut bar from the active window's foreground
+            // command (control mode has no OSC title to carry it).
+            val command = windows.firstOrNull { it.active }?.command
+            if (!command.isNullOrEmpty() && command != lastAppContext) applyContext(command)
+        }
+    }
 
     private fun handleSshOutput(data: ByteArray) {
         val emulator = binding.terminalView.mEmulator ?: return
@@ -480,7 +514,6 @@ class TerminalActivity : AppCompatActivity() {
             val svc = (ibinder as SshConnectionService.LocalBinder).getService()
             service = svc
             bound = true
-            svc.attachOutputListener(outputListener)
             svc.addStatusListener(statusListener)
             val params = pendingParams
             when {
@@ -504,6 +537,25 @@ class TerminalActivity : AppCompatActivity() {
             // per-app shortcut row survives even when the title OSC has rolled
             // out of the buffer.
             useTmux = svc.useTmux
+            if (svc.useTmuxControlMode) {
+                paneManager = PaneManager(
+                    binding.terminalView,
+                    sessionClient,
+                    { svc.requestPaneCapture(it) },
+                    { paneId ->
+                        svc.setInputPane(paneId)
+                        // Switching panes: drop the old pane's tail so a
+                        // password-prompt match can't span the two panes' bytes.
+                        recentOutputTail.reset()
+                    },
+                )
+                svc.attachControlListener(controlListener)
+                // Cold attach gets the window list via %session-changed; a
+                // re-attach to an already-connected service must ask again.
+                if (svc.state == SshConnectionService.State.CONNECTED) svc.requestWindowList()
+            } else {
+                svc.attachOutputListener(outputListener)
+            }
             applyTitle(svc.lastTitle)
             // Already-connected branch: a deeplink fired while the SSH session
             // was alive needs to switch windows now (no onSshConnected callback
@@ -537,6 +589,7 @@ class TerminalActivity : AppCompatActivity() {
             pendingParams = SshConnectionService.ConnectionParams(
                 host, port, username,
                 intent.getBooleanExtra(EXTRA_USE_TMUX, false),
+                intent.getBooleanExtra(EXTRA_TMUX_CONTROL_MODE, false),
             )
         }
         pendingTmuxWindow = intent.getStringExtra(EXTRA_TMUX_WINDOW)
@@ -734,6 +787,48 @@ class TerminalActivity : AppCompatActivity() {
         }
     }
 
+    private var lastControlWindows: List<TmuxControlWindow> = emptyList()
+
+    /** Control-mode tab strip: same look as [applyWindowList] but driven by the
+     *  control-channel window list, with tabs that select by window id. */
+    private fun applyControlWindows(windows: List<TmuxControlWindow>) {
+        if (windows == lastControlWindows) return
+        lastControlWindows = windows
+        val container = binding.windowTabs
+        container.removeAllViews()
+        // Control mode appends its own dynamic "+" tab (wired to newWindow())
+        // below. The static layout "+" must stay hidden here — its tap goes
+        // through openNewTmuxWindow()/writeToSsh, which control mode wraps as
+        // send-keys into the active pane instead of creating a window.
+        binding.windowTabsNew.visibility = View.GONE
+        binding.windowTabsBar.visibility = if (windows.isNotEmpty()) View.VISIBLE else View.GONE
+        if (windows.isEmpty()) return
+        val tabHorizontalPaddingPx = dpToPx(6)
+        val tabMinDimensionPx = dpToPx(32)
+        for (window in windows) {
+            val label = getString(R.string.window_tab_label, window.index, window.name)
+            val tab = makeAuxButton(label) { service?.selectWindow(window.id) }
+            tab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            tab.setPadding(tabHorizontalPaddingPx, 0, tabHorizontalPaddingPx, 0)
+            tab.minWidth = tabMinDimensionPx
+            tab.minimumWidth = tabMinDimensionPx
+            tab.minHeight = tabMinDimensionPx
+            tab.minimumHeight = tabMinDimensionPx
+            styleModifierButton(tab)
+            tab.isActivated = window.active
+            container.addView(tab, auxButtonLayoutParams())
+        }
+        val newTab = makeAuxButton("+") { service?.newWindow() }
+        newTab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        newTab.setPadding(tabHorizontalPaddingPx, 0, tabHorizontalPaddingPx, 0)
+        newTab.minWidth = tabMinDimensionPx
+        newTab.minimumWidth = tabMinDimensionPx
+        newTab.minHeight = tabMinDimensionPx
+        newTab.minimumHeight = tabMinDimensionPx
+        styleModifierButton(newTab)
+        container.addView(newTab, auxButtonLayoutParams())
+    }
+
     /**
      * Send the tmux key sequence that selects window [index]. Indices 0..9
      * map to `prefix + digit`; higher indices go through `prefix : select-
@@ -813,6 +908,7 @@ class TerminalActivity : AppCompatActivity() {
             runShortcutAction("\\r")
         } else {
             {
+                scrollToBottom(binding.terminalView)
                 service?.writeToSsh("$token ".toByteArray(Charsets.UTF_8))
                 bigramTracker.commitToken(token)
             }
@@ -1713,12 +1809,37 @@ class TerminalActivity : AppCompatActivity() {
     private fun setupTerminalScrollRouting() {
         val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean {
+                // A new touch grabs the transcript immediately instead of
+                // fighting a still-running fling animation.
+                abortFling(binding.terminalView)
                 scrollRemainderPx = 0f
                 handlingScrollGesture = false
+                nativeFlingClaimed = false
                 tappedThisGesture = false
                 gestureAxis = GestureAxis.UNDETERMINED
                 pendingSwipeDirection = 0
                 return false
+            }
+
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float,
+            ): Boolean {
+                // Only the native scrollback path (case 3): mouse/dpad routing
+                // and horizontal swipes have no inertia to begin with.
+                if (gestureAxis != GestureAxis.VERTICAL || handlingScrollGesture) return false
+                val emu = binding.terminalView.mEmulator ?: return false
+                if (emu.isMouseTrackingActive || emu.isAlternateBufferActive) return false
+                // TerminalView's own onFling feeds the pixel velocity (x0.25)
+                // into a row-unit Scroller — roughly 10x the finger speed.
+                // Claim the gesture and fling in row units instead; the UP is
+                // then replayed to TerminalView as CANCEL so its fling never
+                // starts.
+                flingScrollback(binding.terminalView, velocityY)
+                nativeFlingClaimed = true
+                return true
             }
 
             override fun onSingleTapUp(e: MotionEvent): Boolean {
@@ -1841,7 +1962,7 @@ class TerminalActivity : AppCompatActivity() {
             detector.onTouchEvent(event)
             val inMouseTracking = binding.terminalView.mEmulator?.isMouseTrackingActive == true
             val tapInMouseTracking = tappedThisGesture && inMouseTracking
-            var consume = handlingScrollGesture || tapInMouseTracking
+            var consume = handlingScrollGesture || tapInMouseTracking || nativeFlingClaimed
             when (event.action) {
                 MotionEvent.ACTION_UP -> {
                     // Tapped a URL? Open it (with confirmation) instead of
@@ -1869,6 +1990,7 @@ class TerminalActivity : AppCompatActivity() {
                     }
                     hideSwipeFeedback()
                     handlingScrollGesture = false
+                    nativeFlingClaimed = false
                     tappedThisGesture = false
                     gestureAxis = GestureAxis.UNDETERMINED
                     pendingSwipeDirection = 0
@@ -1876,6 +1998,7 @@ class TerminalActivity : AppCompatActivity() {
                 MotionEvent.ACTION_CANCEL -> {
                     hideSwipeFeedback()
                     handlingScrollGesture = false
+                    nativeFlingClaimed = false
                     tappedThisGesture = false
                     gestureAxis = GestureAxis.UNDETERMINED
                     pendingSwipeDirection = 0
@@ -1941,6 +2064,10 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private fun writeToSsh(data: ByteArray) {
+        // Typing while scrolled back snaps the view to the live screen, the
+        // way a desktop terminal does — otherwise whatever the remote echoes
+        // for these bytes renders below the viewport and looks like lost input.
+        scrollToBottom(binding.terminalView)
         service?.writeToSsh(data)
         if (secureInputActive) {
             // Bytes during secure input are deliberately kept out of the
@@ -2139,11 +2266,13 @@ class TerminalActivity : AppCompatActivity() {
         pendingTitleHandler.removeCallbacks(pendingTitleRunnable)
         if (bound) {
             service?.detachOutputListener()
+            service?.detachControlListener()
             service?.removeStatusListener(statusListener)
             unbindService(serviceConnection)
             bound = false
             service = null
         }
+        paneManager?.finishAll()
         // Graceful shutdown (not shutdownNow): if a biometric prompt is being
         // dismissed by this very teardown, its error callback is already queued
         // on this executor and must still run so it unblocks the ssh-read thread
@@ -2160,6 +2289,12 @@ class TerminalActivity : AppCompatActivity() {
             binding.terminalView.invalidate()
         }
         override fun onTitleChanged(changedSession: TerminalSession) {
+            // Control mode: pane titles are whatever the foreground app set
+            // (Claude Code animates a spinner there several times a second),
+            // not the TmuxTitle wire format — and every pane fires this
+            // callback. Parsing them would thrash applyContext and the
+            // shortcut bar; the app context comes from list-windows instead.
+            if (paneManager != null) return
             val title = changedSession.title
             // Cache on the service so a subsequent activity instance can pick
             // up the active app context without waiting for tmux to re-emit
@@ -2281,6 +2416,7 @@ class TerminalActivity : AppCompatActivity() {
         const val EXTRA_PORT = "port"
         const val EXTRA_USERNAME = "username"
         const val EXTRA_USE_TMUX = "use_tmux"
+        const val EXTRA_TMUX_CONTROL_MODE = "tmux_control_mode"
         // Deeplink (pss://open?window=...) target. When present, switch to
         // the named tmux window once the SSH session is connected.
         const val EXTRA_TMUX_WINDOW = "tmux_window"
