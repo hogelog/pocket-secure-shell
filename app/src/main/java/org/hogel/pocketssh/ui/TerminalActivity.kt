@@ -206,7 +206,7 @@ class TerminalActivity : AppCompatActivity() {
                     return@runOnUiThread
                 }
                 try {
-                    AlertDialog.Builder(this@TerminalActivity)
+                    val dialog = AlertDialog.Builder(this@TerminalActivity)
                         .setTitle(R.string.host_key_verify_title)
                         .setMessage(
                             getString(
@@ -219,12 +219,24 @@ class TerminalActivity : AppCompatActivity() {
                         )
                         .setCancelable(false)
                         .setPositiveButton(R.string.host_key_accept) { _, _ ->
+                            // Clear the fields first so a destroy racing this
+                            // listener cannot offer a stale result onto a queue
+                            // the receiver has already left.
+                            hostKeyDialog = null
+                            hostKeyResultQueue = null
                             resultQueue.put(true)
                         }
                         .setNegativeButton(android.R.string.cancel) { _, _ ->
+                            hostKeyDialog = null
+                            hostKeyResultQueue = null
                             resultQueue.put(false)
                         }
                         .show()
+                    // Hold the dialog and queue so onDestroy can reject the key
+                    // and unblock the receiver thread if the activity is torn
+                    // down while the dialog is still showing.
+                    hostKeyDialog = dialog
+                    hostKeyResultQueue = resultQueue
                 } catch (e: Exception) {
                     // e.g. BadTokenException showing onto a torn-down window.
                     // Unblock the ssh-read thread by rejecting the key.
@@ -271,6 +283,15 @@ class TerminalActivity : AppCompatActivity() {
     // and the document picker callback knows where to put the file.
     private var scpBrowserDialog: AlertDialog? = null
     private var scpTransferDialog: AlertDialog? = null
+
+    // Active host-key confirmation dialog and the queue its ssh-read thread is
+    // parked on. Held so onDestroy can reject the pending key and unblock that
+    // thread: a uiMode change (dark-mode auto-switch, split-screen) destroys the
+    // activity while the dialog is showing, which force-closes the window
+    // without firing any button or dismiss listener, so nobody would otherwise
+    // hand a result back to the receiver thread.
+    private var hostKeyDialog: AlertDialog? = null
+    private var hostKeyResultQueue: SynchronousQueue<Boolean>? = null
     private var scpUploadTargetDir: String? = null
     private var scpBrowserListView: ListView? = null
     private var scpBrowserPathHeader: TextView? = null
@@ -2102,6 +2123,15 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        // Reject a host-key dialog still showing at teardown: force-closing its
+        // window does not fire the button listeners, so the ssh-read thread
+        // parked on take() would hang forever. offer() (not put()) avoids
+        // blocking here — if the receiver already took a value it simply fails
+        // and is harmless.
+        hostKeyResultQueue?.offer(false)
+        hostKeyResultQueue = null
+        hostKeyDialog?.dismiss()
+        hostKeyDialog = null
         scpBrowserDialog?.dismiss()
         scpBrowserDialog = null
         scpTransferDialog?.dismiss()
