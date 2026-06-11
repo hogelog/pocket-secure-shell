@@ -35,7 +35,15 @@ class SshSession(
 
     /** Blocking; call from a background thread. */
     fun connect() {
+        // Publish the Connection before the blocking handshake so a concurrent
+        // [disconnect] (e.g. the user aborting while still CONNECTING) can close
+        // it and unblock us. Connection.close() is synchronized on the same
+        // monitor as connect()/authenticate, so it cannot interrupt the KEX or
+        // auth read itself; those are bounded by the connect/kex timeouts
+        // below; but it does abort the (unsynchronized) shell-open phase and
+        // any wait after auth completes.
         val conn = Connection(host, port)
+        connection = conn
         // kexTimeout = 0 disables the key-exchange watchdog. On a first
         // connection the TOFU verifier blocks the kex on the receiver thread
         // while the user confirms the host key fingerprint in a dialog; a
@@ -48,7 +56,10 @@ class SshSession(
         } catch (e: Throwable) {
             // authenticateWithPublicKey can throw (e.g. a cancelled biometric
             // surfaces as an IOException from SignatureProxy.sign). Close the
-            // live connection before propagating so it does not leak.
+            // live connection before propagating so it does not leak. conn is
+            // also published to [connection], so the read-loop finally's
+            // disconnect() may close it again; the second close is a harmless
+            // no-op (and disconnect() swallows exceptions anyway).
             conn.close()
             throw e
         }
@@ -57,7 +68,6 @@ class SshSession(
             throw SshAuthenticationException("Public key authentication failed")
         }
 
-        connection = conn
         isConnected = true
     }
 

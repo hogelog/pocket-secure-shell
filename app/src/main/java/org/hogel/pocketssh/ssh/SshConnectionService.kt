@@ -211,6 +211,10 @@ class SshConnectionService : Service() {
                 signatureProxy,
                 hostKeyVerifier,
             )
+            // Publish the session before the blocking handshake so a shutdown()
+            // during CONNECTING (notification Disconnect / UI button) can reach
+            // it and abort, instead of being a no-op until openShell succeeds.
+            session = ssh
             ssh.connect()
             trace { "ssh connected, opening shell" }
             ssh.openShell(
@@ -218,7 +222,6 @@ class SshConnectionService : Service() {
                 rows.coerceAtLeast(1),
                 params.useTmux,
             )
-            session = ssh
             state = State.CONNECTED
             lastConnectedAt = System.currentTimeMillis()
             trace { "state -> CONNECTED" }
@@ -371,6 +374,9 @@ class SshConnectionService : Service() {
     }
 
     fun writeToSsh(data: ByteArray) {
+        // The session is published before the shell channel exists (during
+        // CONNECTING), so gate on CONNECTED before touching stdin.
+        if (state != State.CONNECTED) return
         val out = session?.stdin ?: return
         sshWriteExecutor.execute {
             try {
