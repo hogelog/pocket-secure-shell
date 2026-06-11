@@ -193,13 +193,18 @@ class SshConnectionService : Service() {
         rows: Int,
     ) {
         var caught: Throwable? = null
+        // Held outside the try so the finally can disconnect a connection that
+        // was opened but never published to [session] (e.g. openShell threw
+        // after connect succeeded). Without this the live Connection and its
+        // trilead receiver thread would leak on every failed retry.
+        var ssh: SshSession? = null
         try {
             val keyManager = SshKeyManager()
             val publicKey = keyManager.loadPublicKey()
                 ?: throw SshAuthenticationException("No SSH key found")
             val signatureProxy = KeystoreSignatureProxy(publicKey, keyManager, authenticator)
             val hostKeyVerifier = TofuHostKeyVerifier(HostKeyStore(this), hostKeyPrompt)
-            val ssh = SshSession(
+            ssh = SshSession(
                 params.host,
                 params.port,
                 params.username,
@@ -247,7 +252,11 @@ class SshConnectionService : Service() {
             // so state teardown and onSshDisconnected fire immediately —
             // otherwise the service looks alive (state CONNECTED, session
             // non-null) while every write fails with "channel is closed".
-            val dying = session
+            // Use the worker-local [ssh], not the [session] field: on an
+            // openShell failure the field is still null but the connection is
+            // already live, and only [ssh] holds it. After a successful
+            // connect the two reference the same instance.
+            val dying = ssh
             Thread({ runCatching { dying?.disconnect() } }, "ssh-shutdown-finally")
                 .apply { isDaemon = true }
                 .start()

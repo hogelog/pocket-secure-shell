@@ -43,7 +43,15 @@ class SshSession(
         // key) if they take too long. The TCP connect still has its own timeout.
         conn.connect(hostKeyVerifier, CONNECT_TIMEOUT_MS, NO_KEX_TIMEOUT)
 
-        val authenticated = conn.authenticateWithPublicKey(username, signatureProxy)
+        val authenticated = try {
+            conn.authenticateWithPublicKey(username, signatureProxy)
+        } catch (e: Throwable) {
+            // authenticateWithPublicKey can throw (e.g. a cancelled biometric
+            // surfaces as an IOException from SignatureProxy.sign). Close the
+            // live connection before propagating so it does not leak.
+            conn.close()
+            throw e
+        }
         if (!authenticated) {
             conn.close()
             throw SshAuthenticationException("Public key authentication failed")
