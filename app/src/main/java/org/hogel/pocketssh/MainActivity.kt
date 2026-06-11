@@ -491,10 +491,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyTmuxExpanded(expanded: Boolean) {
         binding.containerTmux.visibility = if (expanded) View.VISIBLE else View.GONE
-        // Control-mode toggle is a debug-only experiment (hidden in release);
-        // it belongs to the tmux section, so it collapses along with it.
+        // Control-mode toggle belongs to the tmux section, so it collapses
+        // along with it.
         binding.switchControlMode.visibility =
-            if (expanded && BuildConfig.DEBUG) View.VISIBLE else View.GONE
+            if (expanded) View.VISIBLE else View.GONE
         binding.textTmuxSummary.visibility = if (expanded) View.GONE else View.VISIBLE
         binding.iconTmuxChevron.rotation = if (expanded) 180f else 0f
         if (!expanded) {
