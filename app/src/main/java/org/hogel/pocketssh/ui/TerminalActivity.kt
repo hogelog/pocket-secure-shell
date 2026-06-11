@@ -530,6 +530,10 @@ class TerminalActivity : AppCompatActivity() {
         binding.windowTabsNew.setOnClickListener { openNewTmuxWindow() }
         binding.fabMain.setOnClickListener { setFabExpanded(!fabExpanded) }
         setFabExpanded(false)
+        binding.btnKeyboard.setOnClickListener {
+            binding.imeProxy.requestFocus()
+            toggleSoftKeyboard()
+        }
         binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
         // Initial sync so the IME proxy / badge visibility match the
         // default-off state on a freshly created activity.
@@ -1670,8 +1674,7 @@ class TerminalActivity : AppCompatActivity() {
      * `TerminalView.onUp` would emit `MOUSE_LEFT_BUTTON` press/release via
      * `emulator.sendMouseEvent`, again echoing through the dummy pty as
      * `^[[<0;x;yM^[[<0;x;ym…`. We swallow the tap-up, then do
-     * `requestFocus()` + `toggleSoftKeyboard()` ourselves so the user's
-     * existing tap-to-toggle-keyboard behavior is preserved.
+     * `requestFocus()` ourselves so the IME proxy stays the IME target.
      *
      * For pinches and for taps in plain-shell mode we leave events untouched.
      */
@@ -1832,7 +1835,6 @@ class TerminalActivity : AppCompatActivity() {
                     if (pendingSwipeDirection != 0) commitPendingSwipe()
                     if (tapInMouseTracking && !openedLink) {
                         binding.imeProxy.requestFocus()
-                        toggleSoftKeyboard()
                     }
                     hideSwipeFeedback()
                     handlingScrollGesture = false
@@ -2167,11 +2169,10 @@ class TerminalActivity : AppCompatActivity() {
             return scale
         }
         override fun onSingleTapUp(e: MotionEvent?) {
-            // Tapping the terminal toggles the soft keyboard so it can be
-            // re-summoned after the user dismisses it with the back gesture.
-            // Focus stays on the IME proxy view (it's the IME target).
+            // Keep focus on the IME proxy view (it's the IME target). The
+            // keyboard itself is summoned via the keyboard button above the
+            // FAB, never by tapping the terminal.
             binding.imeProxy.requestFocus()
-            toggleSoftKeyboard()
         }
         override fun shouldBackButtonBeMappedToEscape(): Boolean = true
         override fun shouldEnforceCharBasedInput(): Boolean = true
