@@ -38,7 +38,15 @@ class SshSession(
         val conn = Connection(host, port)
         conn.connect(hostKeyVerifier, 10_000, 10_000)
 
-        val authenticated = conn.authenticateWithPublicKey(username, signatureProxy)
+        val authenticated = try {
+            conn.authenticateWithPublicKey(username, signatureProxy)
+        } catch (e: Throwable) {
+            // authenticateWithPublicKey can throw (e.g. a cancelled biometric
+            // surfaces as an IOException from SignatureProxy.sign). Close the
+            // live connection before propagating so it does not leak.
+            conn.close()
+            throw e
+        }
         if (!authenticated) {
             conn.close()
             throw SshAuthenticationException("Public key authentication failed")
