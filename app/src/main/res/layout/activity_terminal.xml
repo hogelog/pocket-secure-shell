@@ -81,25 +81,32 @@
                     android:src="@drawable/ic_lock"
                     android:visibility="gone" />
 
-                <ImageButton
-                    android:id="@+id/btn_keyboard"
-                    android:layout_width="32dp"
-                    android:layout_height="32dp"
-                    android:layout_gravity="end"
-                    android:layout_marginTop="8dp"
-                    android:layout_marginEnd="12dp"
-                    android:background="@drawable/bg_keyboard_badge"
-                    android:contentDescription="@string/keyboard_button_description"
-                    android:padding="6dp"
-                    android:src="@drawable/ic_keyboard" />
-
-                <com.google.android.material.floatingactionbutton.FloatingActionButton
-                    android:id="@+id/fab_main"
+                <LinearLayout
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
+                    android:layout_gravity="end"
                     android:layout_marginTop="8dp"
-                    android:contentDescription="@string/fab_menu"
-                    android:src="@drawable/ic_menu" />
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal">
+
+                    <ImageButton
+                        android:id="@+id/btn_keyboard"
+                        android:layout_width="32dp"
+                        android:layout_height="32dp"
+                        android:layout_marginEnd="12dp"
+                        android:background="@drawable/bg_keyboard_badge"
+                        android:contentDescription="@string/keyboard_button_description"
+                        android:padding="6dp"
+                        android:src="@drawable/ic_keyboard" />
+
+                    <com.google.android.material.floatingactionbutton.FloatingActionButton
+                        android:id="@+id/fab_main"
+                        android:layout_width="wrap_content"
+                        android:layout_height="wrap_content"
+                        android:contentDescription="@string/fab_menu"
+                        android:src="@drawable/ic_menu" />
+
+                </LinearLayout>
 
             </LinearLayout>
 
