@@ -147,6 +147,16 @@ class TerminalActivity : AppCompatActivity() {
             }
 
             runOnUiThread {
+                // If the activity was destroyed while CONNECTING (back-press, or
+                // a uiMode change the manifest does not handle), showing the
+                // prompt would crash and, worse, never unblock the ssh-read
+                // thread parked on take() below. Reject immediately instead.
+                if (isFinishing || isDestroyed) {
+                    resultQueue.put(Result.failure(
+                        BiometricAuthenticationException("Activity destroyed before biometric prompt"),
+                    ))
+                    return@runOnUiThread
+                }
                 val prompt = BiometricPrompt(
                     this@TerminalActivity,
                     biometricExecutor,
@@ -160,7 +170,15 @@ class TerminalActivity : AppCompatActivity() {
                         androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG,
                     )
                     .build()
-                prompt.authenticate(info)
+                try {
+                    prompt.authenticate(info)
+                } catch (e: Exception) {
+                    // e.g. IllegalStateException from a fragment commit onto a
+                    // torn-down FragmentActivity. Unblock the ssh-read thread.
+                    resultQueue.put(Result.failure(
+                        BiometricAuthenticationException("Failed to show biometric prompt", e),
+                    ))
+                }
             }
 
             resultQueue.take().getOrThrow()
@@ -179,25 +197,39 @@ class TerminalActivity : AppCompatActivity() {
             // is false so a stray back-press cannot silently accept the key.
             val resultQueue = SynchronousQueue<Boolean>()
             runOnUiThread {
-                AlertDialog.Builder(this@TerminalActivity)
-                    .setTitle(R.string.host_key_verify_title)
-                    .setMessage(
-                        getString(
-                            R.string.host_key_verify_message,
-                            host,
-                            port,
-                            algorithm,
-                            fingerprint,
-                        ),
-                    )
-                    .setCancelable(false)
-                    .setPositiveButton(R.string.host_key_accept) { _, _ ->
-                        resultQueue.put(true)
-                    }
-                    .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        resultQueue.put(false)
-                    }
-                    .show()
+                // If the activity was destroyed while CONNECTING (back-press, or
+                // a uiMode change the manifest does not handle), showing the
+                // dialog would throw BadTokenException and never unblock the
+                // ssh-read thread parked on take() below. Reject the key instead.
+                if (isFinishing || isDestroyed) {
+                    resultQueue.put(false)
+                    return@runOnUiThread
+                }
+                try {
+                    AlertDialog.Builder(this@TerminalActivity)
+                        .setTitle(R.string.host_key_verify_title)
+                        .setMessage(
+                            getString(
+                                R.string.host_key_verify_message,
+                                host,
+                                port,
+                                algorithm,
+                                fingerprint,
+                            ),
+                        )
+                        .setCancelable(false)
+                        .setPositiveButton(R.string.host_key_accept) { _, _ ->
+                            resultQueue.put(true)
+                        }
+                        .setNegativeButton(android.R.string.cancel) { _, _ ->
+                            resultQueue.put(false)
+                        }
+                        .show()
+                } catch (e: Exception) {
+                    // e.g. BadTokenException showing onto a torn-down window.
+                    // Unblock the ssh-read thread by rejecting the key.
+                    resultQueue.put(false)
+                }
             }
             return resultQueue.take()
         }
@@ -2070,7 +2102,12 @@ class TerminalActivity : AppCompatActivity() {
             bound = false
             service = null
         }
-        biometricExecutor.shutdownNow()
+        // Graceful shutdown (not shutdownNow): if a biometric prompt is being
+        // dismissed by this very teardown, its error callback is already queued
+        // on this executor and must still run so it unblocks the ssh-read thread
+        // parked on the result queue. shutdownNow would drop that task and leave
+        // the connection wedged in CONNECTING forever.
+        biometricExecutor.shutdown()
         binding.terminalView.mTermSession?.finishIfRunning()
         super.onDestroy()
     }
