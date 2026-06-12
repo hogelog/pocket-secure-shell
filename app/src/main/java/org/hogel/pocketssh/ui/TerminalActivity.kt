@@ -12,6 +12,8 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -433,6 +435,10 @@ class TerminalActivity : AppCompatActivity() {
     // remote transcription step. It must be created and used on the main thread.
     private var speechRecognizer: SpeechRecognizer? = null
     private val voiceHandler = Handler(Looper.getMainLooper())
+    // Short earcons so the loop's state is audible hands-free: one cue when it
+    // is the user's turn to speak, another when an utterance was sent and a
+    // reply is pending. SPEAKING needs no cue — the TTS itself is the audio.
+    private var voiceTone: ToneGenerator? = null
 
     private val recognitionListener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {}
@@ -1276,8 +1282,7 @@ class TerminalActivity : AppCompatActivity() {
         initVoiceTts()
         binding.btnVoice.setColorFilter(VOICE_MODE_ACTIVE_COLOR)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        voiceConversation = VoiceConversation.LISTENING
-        startConversationListening()
+        startListeningTurn()
     }
 
     private fun exitVoiceConversation() {
@@ -1289,6 +1294,8 @@ class TerminalActivity : AppCompatActivity() {
             runCatching { recognizer.destroy() }
         }
         speechRecognizer = null
+        voiceTone?.release()
+        voiceTone = null
         // Abort an in-flight reply exec: a stranded reply waiter would hog the
         // voice executor and steal the next conversation's reply.
         service?.cancelVoiceExec()
@@ -1320,13 +1327,25 @@ class TerminalActivity : AppCompatActivity() {
 
     private fun resumeListeningAfterSpeech() {
         if (voiceConversation != VoiceConversation.SPEAKING) return
-        voiceConversation = VoiceConversation.LISTENING
-        startConversationListening()
+        startListeningTurn()
     }
 
-    /** Start an on-device recognition pass. The recognizer reports its own
-     *  end-of-speech, so [onRecognizedText] is what advances the loop. */
-    private fun startConversationListening() {
+    /** Begin a fresh user turn: signal "your turn" (earcon + haptic) once, then
+     *  arm the recognizer. The cue fires only here, not on the silent re-arms a
+     *  no-speech timeout triggers, so idle waiting reads as one continuous
+     *  listen rather than a stutter of give-up/restart cycles. */
+    private fun startListeningTurn() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        playVoiceTone(TONE_LISTENING)
+        binding.btnVoice.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        armListening()
+    }
+
+    /** (Re)arm an on-device recognition pass without any cue. The recognizer
+     *  reports its own end-of-speech, so [onRecognizedText] advances the loop;
+     *  Google's engine also times out after a few seconds of pre-speech silence,
+     *  which surfaces as a benign error we just re-arm from. */
+    private fun armListening() {
         if (voiceConversation == VoiceConversation.OFF) return
         val svc = service
         if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
@@ -1340,7 +1359,6 @@ class TerminalActivity : AppCompatActivity() {
             return
         }
         voiceConversation = VoiceConversation.LISTENING
-        binding.btnVoice.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
         binding.swipeFeedback.text = getString(R.string.voice_mode_listening)
         binding.swipeFeedback.visibility = View.VISIBLE
         // A fresh pass must always start from idle: cancel() clears any session
@@ -1352,6 +1370,13 @@ class TerminalActivity : AppCompatActivity() {
             Log.e(TAG, "startListening failed", e)
             restartListeningSoon(RECOGNIZER_RESTART_MS)
         }
+    }
+
+    private fun playVoiceTone(toneType: Int) {
+        val tone = voiceTone ?: runCatching {
+            ToneGenerator(AudioManager.STREAM_MUSIC, VOICE_TONE_VOLUME)
+        }.getOrNull()?.also { voiceTone = it } ?: return
+        runCatching { tone.startTone(toneType) }
     }
 
     private fun ensureSpeechRecognizer(): SpeechRecognizer? {
@@ -1388,7 +1413,8 @@ class TerminalActivity : AppCompatActivity() {
         // more than the one utterance.
         val text = raw.replace(Regex("[\r\n]+"), " ").trim()
         if (text.isEmpty()) {
-            startConversationListening()
+            // Heard nothing usable: re-arm silently, still the same turn.
+            armListening()
             return
         }
         writeToSsh((text + "\r").toByteArray(Charsets.UTF_8))
@@ -1415,7 +1441,7 @@ class TerminalActivity : AppCompatActivity() {
 
     private fun restartListeningSoon(delayMs: Long) {
         voiceHandler.postDelayed({
-            if (voiceConversation == VoiceConversation.LISTENING) startConversationListening()
+            if (voiceConversation == VoiceConversation.LISTENING) armListening()
         }, delayMs)
     }
 
@@ -1427,6 +1453,8 @@ class TerminalActivity : AppCompatActivity() {
             return
         }
         voiceConversation = VoiceConversation.WAITING_REPLY
+        // Cue the handoff: utterance sent, now waiting on the reply.
+        playVoiceTone(TONE_WAITING)
         binding.swipeFeedback.text = getString(R.string.voice_mode_waiting)
         svc.execCommandForOutput(command, ByteArray(0), VOICE_REPLY_TIMEOUT_MS) { result ->
             if (voiceConversation != VoiceConversation.WAITING_REPLY) return@execCommandForOutput
@@ -1434,10 +1462,9 @@ class TerminalActivity : AppCompatActivity() {
                 ?.takeIf { it.exitStatus == 0 }
                 ?.stdout?.trim().orEmpty()
             if (reply.isEmpty()) {
-                // Timeout or failure: resume listening silently — the loop
-                // should survive a missed reply.
-                voiceConversation = VoiceConversation.LISTENING
-                startConversationListening()
+                // Timeout or failure: the loop should survive a missed reply —
+                // hand the turn back with the usual "your turn" cue.
+                startListeningTurn()
             } else {
                 speakVoiceReply(reply)
             }
@@ -2798,6 +2825,12 @@ class TerminalActivity : AppCompatActivity() {
         private const val RECOGNIZER_RESTART_MS = 300L
         private const val RECOGNIZER_BUSY_RETRY_MS = 600L
         private const val VOICE_REPLY_TIMEOUT_MS = 660_000L
+        // State earcons: a rising double beep means "your turn to speak"; a
+        // single ack means "sent, waiting for the reply". Kept distinct so the
+        // loop's state is recognizable by ear alone.
+        private const val VOICE_TONE_VOLUME = 80
+        private const val TONE_LISTENING = ToneGenerator.TONE_PROP_BEEP2
+        private const val TONE_WAITING = ToneGenerator.TONE_PROP_ACK
         private val VOICE_MODE_ACTIVE_COLOR = 0xFFEF5350.toInt()
 
         // Number of learned candidates to render in the suggestions row. Sized
