@@ -17,6 +17,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -416,6 +418,24 @@ class TerminalActivity : AppCompatActivity() {
     private var voiceRecorder: MediaRecorder? = null
     private var voiceRecordStartedAt = 0L
     private var voiceFilterRunning = false
+
+    /**
+     * Conversation mode: a hands-free loop of listen (VAD-segmented) →
+     * filter → auto-send → wait for the reply command → speak its stdout via
+     * the device TTS → listen again. Entered by tapping the mic button (a
+     * hold is still one-shot push-to-talk), exited by tapping again.
+     */
+    private enum class VoiceConversation { OFF, LISTENING, TRANSCRIBING, WAITING_REPLY, SPEAKING }
+
+    private var voiceConversation = VoiceConversation.OFF
+    private var voiceTts: TextToSpeech? = null
+    private var voiceTtsReady = false
+    private var vadSpeechDetected = false
+    private var vadSpeechStartedAt = 0L
+    private var vadLastLoudAt = 0L
+    private var vadListenStartedAt = 0L
+    private val vadHandler = Handler(Looper.getMainLooper())
+    private val vadTick = Runnable { onVadTick() }
 
     // SAF file picker for SCP upload. The chosen file is uploaded into
     // [scpUploadTargetDir], the directory the browser was showing when the
@@ -1197,12 +1217,28 @@ class TerminalActivity : AppCompatActivity() {
         binding.btnVoice.setOnTouchListener { v, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    startVoiceRecording()
+                    // While conversation mode is active the press is an exit
+                    // gesture, not a recording trigger.
+                    if (voiceConversation == VoiceConversation.OFF) {
+                        startVoiceRecording()
+                    }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
                     v.performClick()
-                    finishVoiceRecording(send = true)
+                    if (voiceConversation != VoiceConversation.OFF) {
+                        exitVoiceConversation()
+                    } else if (
+                        voiceRecorder != null && voiceReplyCommand() != null &&
+                        SystemClock.uptimeMillis() - voiceRecordStartedAt < VOICE_MIN_DURATION_MS
+                    ) {
+                        // A tap (vs hold) enters conversation mode when a
+                        // reply command is configured.
+                        finishVoiceRecording(send = false)
+                        enterVoiceConversation()
+                    } else {
+                        finishVoiceRecording(send = true)
+                    }
                     true
                 }
                 MotionEvent.ACTION_CANCEL -> {
@@ -1220,6 +1256,12 @@ class TerminalActivity : AppCompatActivity() {
     private fun voiceFilterCommand(): String? =
         getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
             .getString(MainActivity.KEY_VOICE_FILTER_COMMAND, null)
+            ?.trim()?.takeIf { it.isNotEmpty() }
+
+    /** The configured reply command, or null when conversation mode is off. */
+    private fun voiceReplyCommand(): String? =
+        getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(MainActivity.KEY_VOICE_REPLY_COMMAND, null)
             ?.trim()?.takeIf { it.isNotEmpty() }
 
     private fun startVoiceRecording() {
@@ -1364,6 +1406,235 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private fun voiceRecordingFile(): File = File(cacheDir, "voice-input.ogg")
+
+    private fun enterVoiceConversation() {
+        if (voiceFilterCommand() == null || voiceReplyCommand() == null) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        initVoiceTts()
+        binding.btnVoice.setColorFilter(VOICE_MODE_ACTIVE_COLOR)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        voiceConversation = VoiceConversation.LISTENING
+        startConversationListening()
+    }
+
+    private fun exitVoiceConversation() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        voiceConversation = VoiceConversation.OFF
+        vadHandler.removeCallbacks(vadTick)
+        voiceRecorder?.let { recorder ->
+            runCatching { recorder.stop() }
+            recorder.release()
+        }
+        voiceRecorder = null
+        voiceRecordingFile().delete()
+        // Abort an in-flight filter/reply exec: a stranded reply waiter would
+        // hog the voice executor and steal the next conversation's reply.
+        service?.cancelVoiceExec()
+        voiceTts?.stop()
+        binding.swipeFeedback.visibility = View.GONE
+        binding.btnVoice.clearColorFilter()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun initVoiceTts() {
+        if (voiceTts != null) return
+        // Engine and language follow the device TTS settings; replies are
+        // whatever the remote reply command prints.
+        val tts = TextToSpeech(this) { status ->
+            voiceTtsReady = status == TextToSpeech.SUCCESS
+        }
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread { resumeListeningAfterSpeech() }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                runOnUiThread { resumeListeningAfterSpeech() }
+            }
+        })
+        voiceTts = tts
+    }
+
+    private fun resumeListeningAfterSpeech() {
+        if (voiceConversation != VoiceConversation.SPEAKING) return
+        voiceConversation = VoiceConversation.LISTENING
+        startConversationListening()
+    }
+
+    /** Arm the recorder and start VAD polling; the mic stays hot until speech
+     *  is detected and followed by [VAD_SILENCE_MS] of silence. */
+    private fun startConversationListening() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            exitVoiceConversation()
+            return
+        }
+        val recorder = MediaRecorder(this).apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setOutputFormat(MediaRecorder.OutputFormat.OGG)
+            setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
+            setAudioSamplingRate(16_000)
+            setAudioChannels(1)
+            setAudioEncodingBitRate(24_000)
+            setOutputFile(voiceRecordingFile().absolutePath)
+        }
+        try {
+            recorder.prepare()
+            recorder.start()
+        } catch (e: Exception) {
+            Log.e(TAG, "Conversation-mode recording failed to start", e)
+            recorder.release()
+            Toast.makeText(
+                this,
+                getString(R.string.voice_record_failed, e.message ?: e.javaClass.simpleName),
+                Toast.LENGTH_SHORT,
+            ).show()
+            exitVoiceConversation()
+            return
+        }
+        voiceRecorder = recorder
+        voiceConversation = VoiceConversation.LISTENING
+        vadSpeechDetected = false
+        vadListenStartedAt = SystemClock.uptimeMillis()
+        binding.btnVoice.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        binding.swipeFeedback.text = getString(R.string.voice_mode_listening)
+        binding.swipeFeedback.visibility = View.VISIBLE
+        vadHandler.postDelayed(vadTick, VAD_TICK_MS)
+    }
+
+    private fun onVadTick() {
+        if (voiceConversation != VoiceConversation.LISTENING) return
+        val recorder = voiceRecorder ?: return
+        // getMaxAmplitude returns the peak since the previous call, which is
+        // exactly the per-tick window we want.
+        val amplitude = try {
+            recorder.maxAmplitude
+        } catch (_: Exception) {
+            0
+        }
+        val now = SystemClock.uptimeMillis()
+        if (amplitude >= VAD_START_AMPLITUDE) {
+            if (!vadSpeechDetected) {
+                vadSpeechDetected = true
+                vadSpeechStartedAt = now
+                binding.swipeFeedback.text = getString(R.string.voice_recording)
+            }
+            vadLastLoudAt = now
+        }
+        val utteranceEnded = vadSpeechDetected &&
+            (now - vadLastLoudAt >= VAD_SILENCE_MS || now - vadSpeechStartedAt >= VAD_MAX_UTTERANCE_MS)
+        when {
+            utteranceEnded -> stopListeningAndTranscribe()
+            !vadSpeechDetected && now - vadListenStartedAt >= VAD_IDLE_RESTART_MS -> {
+                // Nothing said for a long while: drop the silence-only cache
+                // file and re-arm instead of letting it grow unbounded.
+                voiceRecorder = null
+                runCatching { recorder.stop() }
+                recorder.release()
+                voiceRecordingFile().delete()
+                startConversationListening()
+            }
+            else -> vadHandler.postDelayed(vadTick, VAD_TICK_MS)
+        }
+    }
+
+    private fun stopListeningAndTranscribe() {
+        val recorder = voiceRecorder ?: return
+        voiceRecorder = null
+        val stopped = runCatching { recorder.stop() }.isSuccess
+        recorder.release()
+        val file = voiceRecordingFile()
+        if (!stopped) {
+            file.delete()
+            startConversationListening()
+            return
+        }
+        val audio = file.readBytes()
+        file.delete()
+        val command = voiceFilterCommand()
+        val svc = service
+        if (command == null || svc == null) {
+            exitVoiceConversation()
+            return
+        }
+        voiceConversation = VoiceConversation.TRANSCRIBING
+        binding.swipeFeedback.text = getString(R.string.voice_transcribing)
+        svc.execCommandForOutput(command, audio, VOICE_FILTER_TIMEOUT_MS) { result ->
+            if (voiceConversation != VoiceConversation.TRANSCRIBING) return@execCommandForOutput
+            val exec = result.getOrNull()
+            // Auto-send must stay a single line: an embedded newline would
+            // submit more than the one utterance.
+            val text = exec?.stdout.orEmpty().replace(Regex("[\r\n]+"), " ").trim()
+            if (exec != null && exec.exitStatus == 0 && text.isNotEmpty()) {
+                writeToSsh((text + "\r").toByteArray(Charsets.UTF_8))
+                Toast.makeText(
+                    this,
+                    getString(R.string.voice_sent_format, text),
+                    Toast.LENGTH_LONG,
+                ).show()
+                waitForVoiceReply()
+            } else {
+                val reason = result.exceptionOrNull()?.message
+                    ?: exec?.stderr?.trim()?.lines()?.lastOrNull { it.isNotBlank() }
+                    ?: "exit ${exec?.exitStatus}"
+                Toast.makeText(
+                    this,
+                    getString(R.string.voice_filter_failed, reason),
+                    Toast.LENGTH_LONG,
+                ).show()
+                voiceConversation = VoiceConversation.LISTENING
+                startConversationListening()
+            }
+        }
+    }
+
+    private fun waitForVoiceReply() {
+        val command = voiceReplyCommand()
+        val svc = service
+        if (command == null || svc == null) {
+            exitVoiceConversation()
+            return
+        }
+        voiceConversation = VoiceConversation.WAITING_REPLY
+        binding.swipeFeedback.text = getString(R.string.voice_mode_waiting)
+        svc.execCommandForOutput(command, ByteArray(0), VOICE_REPLY_TIMEOUT_MS) { result ->
+            if (voiceConversation != VoiceConversation.WAITING_REPLY) return@execCommandForOutput
+            val reply = result.getOrNull()
+                ?.takeIf { it.exitStatus == 0 }
+                ?.stdout?.trim().orEmpty()
+            if (reply.isEmpty()) {
+                // Timeout or failure: resume listening silently — the loop
+                // should survive a missed reply.
+                voiceConversation = VoiceConversation.LISTENING
+                startConversationListening()
+            } else {
+                speakVoiceReply(reply)
+            }
+        }
+    }
+
+    private fun speakVoiceReply(reply: String) {
+        voiceConversation = VoiceConversation.SPEAKING
+        binding.swipeFeedback.text = reply
+        val tts = voiceTts
+        if (tts == null || !voiceTtsReady ||
+            tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "voice-reply") != TextToSpeech.SUCCESS
+        ) {
+            resumeListeningAfterSpeech()
+        }
+    }
 
     private fun extensionForMime(mime: String): String = when (mime.lowercase()) {
         "image/png" -> "png"
@@ -2463,8 +2734,11 @@ class TerminalActivity : AppCompatActivity() {
         hostKeyResultQueue = null
         hostKeyDialog?.dismiss()
         hostKeyDialog = null
+        exitVoiceConversation()
         voiceRecorder?.release()
         voiceRecorder = null
+        voiceTts?.shutdown()
+        voiceTts = null
         scpBrowserDialog?.dismiss()
         scpBrowserDialog = null
         scpTransferDialog?.dismiss()
@@ -2699,6 +2973,18 @@ class TerminalActivity : AppCompatActivity() {
         // filter timeout allows for a slow CPU-bound transcription remote-side.
         private const val VOICE_MIN_DURATION_MS = 400L
         private const val VOICE_FILTER_TIMEOUT_MS = 120_000L
+
+        // Conversation mode. VAD thresholds: MediaRecorder.getMaxAmplitude is
+        // 0..32767; speech starts above VAD_START_AMPLITUDE and an utterance
+        // ends after VAD_SILENCE_MS below it. The reply timeout sits above the
+        // remote waiter's own 600 s timeout so the remote side decides.
+        private const val VAD_TICK_MS = 100L
+        private const val VAD_START_AMPLITUDE = 1500
+        private const val VAD_SILENCE_MS = 1_200L
+        private const val VAD_MAX_UTTERANCE_MS = 30_000L
+        private const val VAD_IDLE_RESTART_MS = 120_000L
+        private const val VOICE_REPLY_TIMEOUT_MS = 660_000L
+        private val VOICE_MODE_ACTIVE_COLOR = 0xFFEF5350.toInt()
 
         // Number of learned candidates to render in the suggestions row. Sized
         // a touch under the always row's eight buttons so the learned row

@@ -48,6 +48,8 @@ object SettingsBackup {
             prefs.getString(MainActivity.KEY_TMUX_PREFIX, null)?.let { put("tmux_prefix", it) }
             prefs.getString(MainActivity.KEY_VOICE_FILTER_COMMAND, null)
                 ?.takeIf { it.isNotBlank() }?.let { put("voice_filter_command", it) }
+            prefs.getString(MainActivity.KEY_VOICE_REPLY_COMMAND, null)
+                ?.takeIf { it.isNotBlank() }?.let { put("voice_reply_command", it) }
         }
         val groupsJson = ShortcutStore.encodeContextGroups(store.loadContextGroups())
 
@@ -102,6 +104,9 @@ object SettingsBackup {
                 connection.voiceFilterCommand?.let {
                     putString(MainActivity.KEY_VOICE_FILTER_COMMAND, it)
                 }
+                connection.voiceReplyCommand?.let {
+                    putString(MainActivity.KEY_VOICE_REPLY_COMMAND, it)
+                }
             }
         }
         if (terminal != null) {
@@ -127,6 +132,7 @@ object SettingsBackup {
         val useTmux: Boolean?,
         val tmuxPrefix: String?,
         val voiceFilterCommand: String?,
+        val voiceReplyCommand: String?,
     )
 
     private fun decodeConnection(obj: JSONObject) = Connection(
@@ -136,6 +142,7 @@ object SettingsBackup {
         useTmux = if (obj.has("use_tmux")) obj.getBoolean("use_tmux") else null,
         tmuxPrefix = if (obj.has("tmux_prefix")) obj.getString("tmux_prefix") else null,
         voiceFilterCommand = if (obj.has("voice_filter_command")) obj.getString("voice_filter_command") else null,
+        voiceReplyCommand = if (obj.has("voice_reply_command")) obj.getString("voice_reply_command") else null,
     )
 
     private class Terminal(val fontSizePx: Int?)

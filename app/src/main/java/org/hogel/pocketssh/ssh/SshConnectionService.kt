@@ -159,6 +159,12 @@ class SshConnectionService : Service() {
         Thread(r, "ssh-scp").apply { isDaemon = true }
     }
 
+    // Voice filter / reply commands get their own executor: a conversation-mode
+    // reply wait can block for minutes and must not stall SCP transfers.
+    private val voiceExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ssh-voice").apply { isDaemon = true }
+    }
+
     // The in-flight upload, so its notification's cancel action can interrupt
     // it without tearing down the SSH connection.
     @Volatile
@@ -688,9 +694,9 @@ class SshConnectionService : Service() {
     /**
      * Run [command] on a separate exec channel, feeding [input] to its stdin
      * and capturing its output (used by voice input to pipe a recording
-     * through the configured filter command). Runs on [scpExecutor] so it
-     * serializes with file transfers, not keystrokes; [onResult] is posted on
-     * the main thread with the exec result or the failure.
+     * through the configured filter command, and to wait for conversation-mode
+     * replies). Runs on [voiceExecutor]; [onResult] is posted on the main
+     * thread with the exec result or the failure.
      */
     fun execCommandForOutput(
         command: String,
@@ -703,11 +709,16 @@ class SshConnectionService : Service() {
             mainHandler.post { onResult(Result.failure(IllegalStateException("Not connected"))) }
             return
         }
-        scpExecutor.execute {
+        voiceExecutor.execute {
             val result = runCatching { ssh.execCommandForOutput(command, input, timeoutMs) }
             result.exceptionOrNull()?.let { Log.e(TAG, "execCommandForOutput failed", it) }
             mainHandler.post { onResult(result) }
         }
+    }
+
+    /** Abort the in-flight voice filter/reply exec (if any). */
+    fun cancelVoiceExec() {
+        session?.cancelExecCommandForOutput()
     }
 
     /**
@@ -878,6 +889,7 @@ class SshConnectionService : Service() {
     override fun onDestroy() {
         sshWriteExecutor.shutdownNow()
         scpExecutor.shutdownNow()
+        voiceExecutor.shutdownNow()
         keepaliveExecutor.shutdownNow()
         probeExecutor.shutdownNow()
         super.onDestroy()

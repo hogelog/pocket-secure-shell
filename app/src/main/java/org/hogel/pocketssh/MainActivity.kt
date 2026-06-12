@@ -537,19 +537,34 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupVoiceFilterRow() {
-        updateVoiceFilterSummary()
-        binding.rowVoiceFilter.setOnClickListener { showVoiceFilterDialog() }
+        updateVoiceCommandSummaries()
+        binding.rowVoiceFilter.setOnClickListener {
+            showVoiceCommandDialog(
+                KEY_VOICE_FILTER_COMMAND,
+                R.string.voice_filter_command,
+                R.string.voice_filter_command_dialog_message,
+            )
+        }
+        binding.rowVoiceReply.setOnClickListener {
+            showVoiceCommandDialog(
+                KEY_VOICE_REPLY_COMMAND,
+                R.string.voice_reply_command,
+                R.string.voice_reply_command_dialog_message,
+            )
+        }
     }
 
-    private fun updateVoiceFilterSummary() {
-        val command = prefs.getString(KEY_VOICE_FILTER_COMMAND, null)?.trim().orEmpty()
-        binding.textVoiceFilterValue.text =
-            command.ifEmpty { getString(R.string.voice_filter_command_value_off) }
+    private fun updateVoiceCommandSummaries() {
+        fun summary(key: String): String =
+            prefs.getString(key, null)?.trim().orEmpty()
+                .ifEmpty { getString(R.string.voice_filter_command_value_off) }
+        binding.textVoiceFilterValue.text = summary(KEY_VOICE_FILTER_COMMAND)
+        binding.textVoiceReplyValue.text = summary(KEY_VOICE_REPLY_COMMAND)
     }
 
-    private fun showVoiceFilterDialog() {
+    private fun showVoiceCommandDialog(key: String, titleRes: Int, messageRes: Int) {
         val edit = EditText(this).apply {
-            setText(prefs.getString(KEY_VOICE_FILTER_COMMAND, null).orEmpty())
+            setText(prefs.getString(key, null).orEmpty())
             setSelection(text.length)
             isSingleLine = true
             typeface = android.graphics.Typeface.MONOSPACE
@@ -560,12 +575,12 @@ class MainActivity : AppCompatActivity() {
             addView(edit)
         }
         AlertDialog.Builder(this)
-            .setTitle(R.string.voice_filter_command)
-            .setMessage(R.string.voice_filter_command_dialog_message)
+            .setTitle(titleRes)
+            .setMessage(messageRes)
             .setView(container)
             .setPositiveButton(android.R.string.ok) { _, _ ->
-                prefs.edit { putString(KEY_VOICE_FILTER_COMMAND, edit.text.toString().trim()) }
-                updateVoiceFilterSummary()
+                prefs.edit { putString(key, edit.text.toString().trim()) }
+                updateVoiceCommandSummaries()
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
@@ -607,6 +622,7 @@ class MainActivity : AppCompatActivity() {
         internal const val KEY_USE_TMUX = "use_tmux"
         internal const val KEY_TMUX_PREFIX = "tmux_prefix"
         internal const val KEY_VOICE_FILTER_COMMAND = "voice_filter_command"
+        internal const val KEY_VOICE_REPLY_COMMAND = "voice_reply_command"
         private const val DEFAULT_TMUX_PREFIX = "b"
         // Experimental tmux control-mode (`tmux -CC`) opt-in. Debug builds only;
         // not part of SettingsBackup. Removed once control mode is the default.

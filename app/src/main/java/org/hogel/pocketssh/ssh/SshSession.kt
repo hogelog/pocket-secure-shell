@@ -304,16 +304,23 @@ class SshSession(
     /** Result of [execCommandForOutput]: remote exit status plus decoded output. */
     data class ExecResult(val exitStatus: Int, val stdout: String, val stderr: String)
 
+    // The in-flight execCommandForOutput channel, so the (possibly
+    // minutes-long) blocking read can be aborted from another thread.
+    @Volatile
+    private var outputExecSession: Session? = null
+
     /**
      * Like [execCommand], but feeds [input] to the remote command's stdin and
      * captures its stdout/stderr. The reads block until the remote closes the
      * streams, so [timeoutMs] only bounds the final exit-status wait — the
-     * remote command must consume stdin and terminate on its own. Call from a
-     * background thread.
+     * remote command must consume stdin and terminate on its own (or the
+     * caller aborts via [cancelExecCommandForOutput]). Call from a background
+     * thread.
      */
     fun execCommandForOutput(command: String, input: ByteArray, timeoutMs: Long): ExecResult {
         val conn = connection ?: throw IllegalStateException("Not connected")
         val sess = conn.openSession()
+        outputExecSession = sess
         try {
             sess.execCommand(command)
             sess.stdin.use { it.write(input) }
@@ -329,8 +336,19 @@ class SshSession(
                 stderr.toString(Charsets.UTF_8),
             )
         } finally {
+            outputExecSession = null
             try { sess.close() } catch (_: Exception) {}
         }
+    }
+
+    /**
+     * Abort an in-flight [execCommandForOutput] by closing its channel. The
+     * blocked reads fail over, and sshd kills the remote command on channel
+     * close — without this, leaving conversation mode would strand a reply
+     * waiter that steals the next reply.
+     */
+    fun cancelExecCommandForOutput() {
+        try { outputExecSession?.close() } catch (_: Exception) {}
     }
 
     /** Send an SSH_MSG_IGNORE packet to keep NAT/firewall mappings warm. */
