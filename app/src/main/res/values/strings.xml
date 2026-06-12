@@ -89,6 +89,7 @@
     <string name="voice_reply_command">Voice reply command</string>
     <string name="voice_reply_command_dialog_message">Remote command run after each utterance in conversation mode; its stdout is read aloud with the device TTS. Tap the mic button to enter conversation mode (hands-free loop: speak → send → listen to the reply → speak). Leave empty to disable.</string>
     <string name="voice_mode_listening">● Listening…</string>
+    <string name="voice_stt_unavailable">On-device speech recognition unavailable</string>
     <string name="voice_mode_waiting">Waiting for reply…</string>
     <string name="voice_sent_format">→ %1$s</string>
     <string name="ctrl_input_title">Control input</string>
