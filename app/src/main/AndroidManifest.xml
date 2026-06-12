@@ -37,7 +37,7 @@
         <activity
             android:name=".ui.TerminalActivity"
             android:launchMode="singleTask"
-            android:windowSoftInputMode="adjustResize"
+            android:windowSoftInputMode="stateUnchanged|adjustResize"
             android:configChanges="keyboard|keyboardHidden|screenSize|orientation" />
 
         <activity
