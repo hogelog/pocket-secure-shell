@@ -1282,6 +1282,10 @@ class TerminalActivity : AppCompatActivity() {
         initVoiceTts()
         binding.btnVoice.setColorFilter(VOICE_MODE_ACTIVE_COLOR)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Move off OFF before the first turn: startListeningTurn() guards on OFF
+        // to suppress cues fired after a mid-flight exit, which would otherwise
+        // swallow this very entry.
+        voiceConversation = VoiceConversation.LISTENING
         startListeningTurn()
     }
 
