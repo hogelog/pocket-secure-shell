@@ -12,6 +12,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
@@ -26,6 +27,7 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -49,6 +51,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -57,6 +60,7 @@ import java.util.TimeZone
 import java.util.concurrent.Executors
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import org.hogel.pocketssh.MainActivity
 import org.hogel.pocketssh.R
 import org.hogel.pocketssh.databinding.ActivityTerminalBinding
 import org.hogel.pocketssh.learning.BigramStore
@@ -74,6 +78,7 @@ import org.hogel.pocketssh.ssh.HostKeyPrompt
 import org.hogel.pocketssh.ssh.RemoteListing
 import org.hogel.pocketssh.ssh.SshConnectionService
 import org.hogel.pocketssh.ssh.SshKeyManager
+import org.hogel.pocketssh.ssh.SshSession
 import org.hogel.pocketssh.tmux.TmuxControlWindow
 import org.hogel.pocketssh.tmux.TmuxTitle
 import org.hogel.pocketssh.tmux.TmuxWindow
@@ -398,6 +403,20 @@ class TerminalActivity : AppCompatActivity() {
         ActivityResultContracts.PickVisualMedia(),
     ) { uri -> if (uri != null) onImagePicked(uri) }
 
+    // Voice input (push-to-talk): permission is requested on the first press;
+    // that press only grants — the user holds again to actually record.
+    private val recordAudioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (!granted) {
+            Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private var voiceRecorder: MediaRecorder? = null
+    private var voiceRecordStartedAt = 0L
+    private var voiceFilterRunning = false
+
     // SAF file picker for SCP upload. The chosen file is uploaded into
     // [scpUploadTargetDir], the directory the browser was showing when the
     // user tapped "Upload here".
@@ -608,6 +627,7 @@ class TerminalActivity : AppCompatActivity() {
             binding.imeProxy.requestFocus()
             toggleSoftKeyboard()
         }
+        setupVoiceButton()
         binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
         // Initial sync so the IME proxy / badge visibility match the
         // default-off state on a freshly created activity.
@@ -634,6 +654,9 @@ class TerminalActivity : AppCompatActivity() {
         // the cascade on every resume so edits take effect the moment we come
         // back, without waiting for tmux to re-emit the title OSC.
         applyContext(lastAppContext)
+        // Same for the voice filter command, which is edited on the main screen.
+        binding.btnVoice.visibility =
+            if (voiceFilterCommand() != null) View.VISIBLE else View.GONE
         maybeProbeLiveness()
     }
 
@@ -1160,6 +1183,187 @@ class TerminalActivity : AppCompatActivity() {
             }
         }
     }
+
+    /**
+     * Voice input is a generic primitive: hold the mic button to record, the
+     * recording is piped to the stdin of a user-configured remote command, and
+     * that command's stdout is shown for confirmation and inserted as if typed.
+     * pss knows nothing about speech recognition — engine, vocabulary, and any
+     * post-processing live entirely in the remote filter command.
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupVoiceButton() {
+        binding.btnVoice.setOnClickListener { /* handled by touch listener */ }
+        binding.btnVoice.setOnTouchListener { v, event ->
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    startVoiceRecording()
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    v.performClick()
+                    finishVoiceRecording(send = true)
+                    true
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    finishVoiceRecording(send = false)
+                    true
+                }
+                else -> false
+            }
+        }
+        binding.btnVoice.visibility =
+            if (voiceFilterCommand() != null) View.VISIBLE else View.GONE
+    }
+
+    /** The configured remote filter command, or null when voice input is off. */
+    private fun voiceFilterCommand(): String? =
+        getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(MainActivity.KEY_VOICE_FILTER_COMMAND, null)
+            ?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun startVoiceRecording() {
+        if (voiceRecorder != null || voiceFilterRunning) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val recorder = MediaRecorder(this).apply {
+            setAudioSource(MediaRecorder.AudioSource.MIC)
+            setOutputFormat(MediaRecorder.OutputFormat.OGG)
+            setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
+            // Whisper-family models downsample to 16 kHz mono anyway; recording
+            // at that rate keeps a 10 s utterance around 30 KB.
+            setAudioSamplingRate(16_000)
+            setAudioChannels(1)
+            setAudioEncodingBitRate(24_000)
+            setOutputFile(voiceRecordingFile().absolutePath)
+        }
+        try {
+            recorder.prepare()
+            recorder.start()
+        } catch (e: Exception) {
+            Log.e(TAG, "Voice recording failed to start", e)
+            recorder.release()
+            Toast.makeText(
+                this,
+                getString(R.string.voice_record_failed, e.message ?: e.javaClass.simpleName),
+                Toast.LENGTH_SHORT,
+            ).show()
+            return
+        }
+        voiceRecorder = recorder
+        voiceRecordStartedAt = SystemClock.uptimeMillis()
+        // Haptic marks the moment capture is live: MediaRecorder.start() has
+        // noticeable latency, and speaking before it costs the first word.
+        binding.btnVoice.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        binding.swipeFeedback.text = getString(R.string.voice_recording)
+        binding.swipeFeedback.visibility = View.VISIBLE
+    }
+
+    private fun finishVoiceRecording(send: Boolean) {
+        val recorder = voiceRecorder ?: return
+        voiceRecorder = null
+        binding.swipeFeedback.visibility = View.GONE
+        val longEnough =
+            SystemClock.uptimeMillis() - voiceRecordStartedAt >= VOICE_MIN_DURATION_MS
+        // stop() throws when no valid data was captured (e.g. released
+        // immediately); treat that the same as a too-short press.
+        val stopped = runCatching { recorder.stop() }.isSuccess
+        recorder.release()
+        val file = voiceRecordingFile()
+        if (!send || !stopped || !longEnough) {
+            if (send) {
+                Toast.makeText(this, R.string.voice_too_short, Toast.LENGTH_SHORT).show()
+            }
+            file.delete()
+            return
+        }
+        val audio = file.readBytes()
+        file.delete()
+        runVoiceFilter(audio)
+    }
+
+    private fun runVoiceFilter(audio: ByteArray) {
+        val command = voiceFilterCommand() ?: return
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        voiceFilterRunning = true
+        binding.swipeFeedback.text = getString(R.string.voice_transcribing)
+        binding.swipeFeedback.visibility = View.VISIBLE
+        svc.execCommandForOutput(command, audio, VOICE_FILTER_TIMEOUT_MS) { result ->
+            voiceFilterRunning = false
+            binding.swipeFeedback.visibility = View.GONE
+            result.fold(
+                onSuccess = { exec -> onVoiceFilterDone(exec) },
+                onFailure = { e ->
+                    Toast.makeText(
+                        this,
+                        getString(R.string.voice_filter_failed, e.message ?: e.javaClass.simpleName),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                },
+            )
+        }
+    }
+
+    private fun onVoiceFilterDone(exec: SshSession.ExecResult) {
+        // Trailing newlines would submit the line in the terminal; inserting
+        // must never do more than typing would.
+        val text = exec.stdout.trimEnd('\n', '\r')
+        if (exec.exitStatus != 0 || text.isEmpty()) {
+            val reason = exec.stderr.trim().lines().lastOrNull { it.isNotBlank() }
+                ?: "exit ${exec.exitStatus}"
+            Toast.makeText(
+                this,
+                getString(R.string.voice_filter_failed, reason),
+                Toast.LENGTH_LONG,
+            ).show()
+            return
+        }
+        showVoiceResultDialog(text)
+    }
+
+    /**
+     * Show the filter output for review before insertion — recognition errors
+     * must not flow into the terminal unseen. The text is editable so small
+     * fixes don't require re-recording.
+     */
+    private fun showVoiceResultDialog(text: String) {
+        val edit = EditText(this).apply {
+            setText(text)
+            setSelection(length())
+        }
+        val pad = dpToPx(16)
+        val container = FrameLayout(this).apply {
+            setPadding(pad, pad / 2, pad, 0)
+            addView(edit)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.voice_result_title)
+            .setView(container)
+            .setPositiveButton(R.string.voice_insert) { _, _ ->
+                val finalText = edit.text.toString()
+                if (finalText.isNotEmpty()) {
+                    writeToSsh(finalText.toByteArray(Charsets.UTF_8))
+                }
+                binding.imeProxy.requestFocus()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun voiceRecordingFile(): File = File(cacheDir, "voice-input.ogg")
 
     private fun extensionForMime(mime: String): String = when (mime.lowercase()) {
         "image/png" -> "png"
@@ -2259,6 +2463,8 @@ class TerminalActivity : AppCompatActivity() {
         hostKeyResultQueue = null
         hostKeyDialog?.dismiss()
         hostKeyDialog = null
+        voiceRecorder?.release()
+        voiceRecorder = null
         scpBrowserDialog?.dismiss()
         scpBrowserDialog = null
         scpTransferDialog?.dismiss()
@@ -2488,6 +2694,11 @@ class TerminalActivity : AppCompatActivity() {
         // Picked images are uploaded under /tmp on the remote host so they
         // are wiped automatically on reboot — no explicit cleanup is needed.
         private const val REMOTE_TMP_DIR = "/tmp"
+
+        // Voice input: presses shorter than this are accidental taps, and the
+        // filter timeout allows for a slow CPU-bound transcription remote-side.
+        private const val VOICE_MIN_DURATION_MS = 400L
+        private const val VOICE_FILTER_TIMEOUT_MS = 120_000L
 
         // Number of learned candidates to render in the suggestions row. Sized
         // a touch under the always row's eight buttons so the learned row

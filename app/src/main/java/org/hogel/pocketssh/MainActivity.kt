@@ -107,6 +107,7 @@ class MainActivity : AppCompatActivity() {
         setupTmuxPrefixRow()
         setupTmuxToggle()
         setupShortcutsRow()
+        setupVoiceFilterRow()
 
         updatePublicKeyDisplay()
 
@@ -535,6 +536,41 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    private fun setupVoiceFilterRow() {
+        updateVoiceFilterSummary()
+        binding.rowVoiceFilter.setOnClickListener { showVoiceFilterDialog() }
+    }
+
+    private fun updateVoiceFilterSummary() {
+        val command = prefs.getString(KEY_VOICE_FILTER_COMMAND, null)?.trim().orEmpty()
+        binding.textVoiceFilterValue.text =
+            command.ifEmpty { getString(R.string.voice_filter_command_value_off) }
+    }
+
+    private fun showVoiceFilterDialog() {
+        val edit = EditText(this).apply {
+            setText(prefs.getString(KEY_VOICE_FILTER_COMMAND, null).orEmpty())
+            setSelection(text.length)
+            isSingleLine = true
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        val pad = (resources.displayMetrics.density * 24).toInt()
+        val container = FrameLayout(this).apply {
+            setPadding(pad, pad / 2, pad, 0)
+            addView(edit)
+        }
+        AlertDialog.Builder(this)
+            .setTitle(R.string.voice_filter_command)
+            .setMessage(R.string.voice_filter_command_dialog_message)
+            .setView(container)
+            .setPositiveButton(android.R.string.ok) { _, _ ->
+                prefs.edit { putString(KEY_VOICE_FILTER_COMMAND, edit.text.toString().trim()) }
+                updateVoiceFilterSummary()
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
     private fun normalizeTmuxPrefix(input: String?): String {
         val trimmed = input?.trim()?.lowercase().orEmpty()
         if (trimmed.length == 1 && trimmed[0] in 'a'..'z') return trimmed
@@ -570,6 +606,7 @@ class MainActivity : AppCompatActivity() {
         internal const val KEY_USERNAME = "username"
         internal const val KEY_USE_TMUX = "use_tmux"
         internal const val KEY_TMUX_PREFIX = "tmux_prefix"
+        internal const val KEY_VOICE_FILTER_COMMAND = "voice_filter_command"
         private const val DEFAULT_TMUX_PREFIX = "b"
         // Experimental tmux control-mode (`tmux -CC`) opt-in. Debug builds only;
         // not part of SettingsBackup. Removed once control mode is the default.

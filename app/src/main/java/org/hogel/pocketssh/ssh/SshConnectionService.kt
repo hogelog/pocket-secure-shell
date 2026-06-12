@@ -686,6 +686,31 @@ class SshConnectionService : Service() {
     }
 
     /**
+     * Run [command] on a separate exec channel, feeding [input] to its stdin
+     * and capturing its output (used by voice input to pipe a recording
+     * through the configured filter command). Runs on [scpExecutor] so it
+     * serializes with file transfers, not keystrokes; [onResult] is posted on
+     * the main thread with the exec result or the failure.
+     */
+    fun execCommandForOutput(
+        command: String,
+        input: ByteArray,
+        timeoutMs: Long,
+        onResult: (Result<SshSession.ExecResult>) -> Unit,
+    ) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(Result.failure(IllegalStateException("Not connected"))) }
+            return
+        }
+        scpExecutor.execute {
+            val result = runCatching { ssh.execCommandForOutput(command, input, timeoutMs) }
+            result.exceptionOrNull()?.let { Log.e(TAG, "execCommandForOutput failed", it) }
+            mainHandler.post { onResult(result) }
+        }
+    }
+
+    /**
      * List remote directory [path] via SFTP for the file browser. [onResult] is
      * invoked on the main thread with the resolved absolute path and entries on
      * success, or the thrown error on failure. Runs on the same single-threaded
