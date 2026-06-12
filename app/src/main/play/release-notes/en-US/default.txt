@@ -1,3 +1,5 @@
-- Tapping near a link now opens it more reliably.
-- Uploads run in the background with a progress notification.
-- Large file uploads no longer run out of memory.
+- New experimental tmux control mode (opt-in): native window tabs and smooth momentum scrolling over the whole scrollback
+- Keyboard now toggles via a dedicated button above the FAB
+- Clearer error when a biometric change invalidates the stored SSH key
+- Fix host-key confirmation timing out on first connect
+- Stability fixes: crashes after leaving the terminal screen, aborting a stuck connection, settings import
