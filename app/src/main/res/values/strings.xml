@@ -76,16 +76,13 @@
     <string name="scp_copy_done">Copied %1$s to clipboard</string>
     <string name="scp_copy_failed">Copy failed: %1$s</string>
     <string name="scp_copy_cancelled">Copy cancelled</string>
-    <string name="voice_button_description">Hold to record voice input</string>
+    <string name="voice_button_description">Toggle voice conversation mode</string>
     <string name="voice_recording">● Recording…</string>
     <string name="voice_transcribing">Transcribing…</string>
-    <string name="voice_too_short">Recording too short</string>
     <string name="voice_not_connected">Not connected</string>
     <string name="voice_permission_denied">Microphone permission denied</string>
     <string name="voice_record_failed">Recording failed: %1$s</string>
     <string name="voice_filter_failed">Voice filter failed: %1$s</string>
-    <string name="voice_result_title">Voice input</string>
-    <string name="voice_insert">Insert</string>
     <string name="voice_filter_command">Voice input filter</string>
     <string name="voice_filter_command_value_off">Off</string>
     <string name="voice_filter_command_dialog_message">Remote command for voice input. It receives the recorded audio (Ogg/Opus) on stdin; its stdout is inserted into the terminal. Leave empty to disable the mic button.</string>

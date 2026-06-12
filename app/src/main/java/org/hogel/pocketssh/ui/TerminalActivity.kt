@@ -416,14 +416,11 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private var voiceRecorder: MediaRecorder? = null
-    private var voiceRecordStartedAt = 0L
-    private var voiceFilterRunning = false
 
     /**
      * Conversation mode: a hands-free loop of listen (VAD-segmented) →
      * filter → auto-send → wait for the reply command → speak its stdout via
-     * the device TTS → listen again. Entered by tapping the mic button (a
-     * hold is still one-shot push-to-talk), exited by tapping again.
+     * the device TTS → listen again. The mic button toggles it.
      */
     private enum class VoiceConversation { OFF, LISTENING, TRANSCRIBING, WAITING_REPLY, SPEAKING }
 
@@ -674,9 +671,8 @@ class TerminalActivity : AppCompatActivity() {
         // the cascade on every resume so edits take effect the moment we come
         // back, without waiting for tmux to re-emit the title OSC.
         applyContext(lastAppContext)
-        // Same for the voice filter command, which is edited on the main screen.
-        binding.btnVoice.visibility =
-            if (voiceFilterCommand() != null) View.VISIBLE else View.GONE
+        // Same for the voice commands, which are edited on the main screen.
+        updateVoiceButtonVisibility()
         maybeProbeLiveness()
     }
 
@@ -1205,51 +1201,32 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Voice input is a generic primitive: hold the mic button to record, the
-     * recording is piped to the stdin of a user-configured remote command, and
-     * that command's stdout is shown for confirmation and inserted as if typed.
-     * pss knows nothing about speech recognition — engine, vocabulary, and any
-     * post-processing live entirely in the remote filter command.
+     * Voice input is a generic primitive — pss knows nothing about speech
+     * recognition. Recordings are piped to the stdin of a user-configured
+     * remote filter command whose stdout is inserted as typed input, and the
+     * reply command's stdout is read aloud. Engine, vocabulary, and any
+     * post-processing live entirely in those remote commands. One-shot
+     * dictation is deliberately not offered: the IME's voice typing already
+     * covers it.
      */
-    @SuppressLint("ClickableViewAccessibility")
     private fun setupVoiceButton() {
-        binding.btnVoice.setOnClickListener { /* handled by touch listener */ }
-        binding.btnVoice.setOnTouchListener { v, event ->
-            when (event.actionMasked) {
-                MotionEvent.ACTION_DOWN -> {
-                    // While conversation mode is active the press is an exit
-                    // gesture, not a recording trigger.
-                    if (voiceConversation == VoiceConversation.OFF) {
-                        startVoiceRecording()
-                    }
-                    true
-                }
-                MotionEvent.ACTION_UP -> {
-                    v.performClick()
-                    if (voiceConversation != VoiceConversation.OFF) {
-                        exitVoiceConversation()
-                    } else if (
-                        voiceRecorder != null && voiceReplyCommand() != null &&
-                        SystemClock.uptimeMillis() - voiceRecordStartedAt < VOICE_MIN_DURATION_MS
-                    ) {
-                        // A tap (vs hold) enters conversation mode when a
-                        // reply command is configured.
-                        finishVoiceRecording(send = false)
-                        enterVoiceConversation()
-                    } else {
-                        finishVoiceRecording(send = true)
-                    }
-                    true
-                }
-                MotionEvent.ACTION_CANCEL -> {
-                    finishVoiceRecording(send = false)
-                    true
-                }
-                else -> false
+        binding.btnVoice.setOnClickListener {
+            if (voiceConversation == VoiceConversation.OFF) {
+                enterVoiceConversation()
+            } else {
+                exitVoiceConversation()
             }
         }
+        updateVoiceButtonVisibility()
+    }
+
+    private fun updateVoiceButtonVisibility() {
         binding.btnVoice.visibility =
-            if (voiceFilterCommand() != null) View.VISIBLE else View.GONE
+            if (voiceFilterCommand() != null && voiceReplyCommand() != null) {
+                View.VISIBLE
+            } else {
+                View.GONE
+            }
     }
 
     /** The configured remote filter command, or null when voice input is off. */
@@ -1263,147 +1240,6 @@ class TerminalActivity : AppCompatActivity() {
         getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
             .getString(MainActivity.KEY_VOICE_REPLY_COMMAND, null)
             ?.trim()?.takeIf { it.isNotEmpty() }
-
-    private fun startVoiceRecording() {
-        if (voiceRecorder != null || voiceFilterRunning) return
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED
-        ) {
-            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            return
-        }
-        val svc = service
-        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
-            Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
-            return
-        }
-        val recorder = MediaRecorder(this).apply {
-            setAudioSource(MediaRecorder.AudioSource.MIC)
-            setOutputFormat(MediaRecorder.OutputFormat.OGG)
-            setAudioEncoder(MediaRecorder.AudioEncoder.OPUS)
-            // Whisper-family models downsample to 16 kHz mono anyway; recording
-            // at that rate keeps a 10 s utterance around 30 KB.
-            setAudioSamplingRate(16_000)
-            setAudioChannels(1)
-            setAudioEncodingBitRate(24_000)
-            setOutputFile(voiceRecordingFile().absolutePath)
-        }
-        try {
-            recorder.prepare()
-            recorder.start()
-        } catch (e: Exception) {
-            Log.e(TAG, "Voice recording failed to start", e)
-            recorder.release()
-            Toast.makeText(
-                this,
-                getString(R.string.voice_record_failed, e.message ?: e.javaClass.simpleName),
-                Toast.LENGTH_SHORT,
-            ).show()
-            return
-        }
-        voiceRecorder = recorder
-        voiceRecordStartedAt = SystemClock.uptimeMillis()
-        // Haptic marks the moment capture is live: MediaRecorder.start() has
-        // noticeable latency, and speaking before it costs the first word.
-        binding.btnVoice.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-        binding.swipeFeedback.text = getString(R.string.voice_recording)
-        binding.swipeFeedback.visibility = View.VISIBLE
-    }
-
-    private fun finishVoiceRecording(send: Boolean) {
-        val recorder = voiceRecorder ?: return
-        voiceRecorder = null
-        binding.swipeFeedback.visibility = View.GONE
-        val longEnough =
-            SystemClock.uptimeMillis() - voiceRecordStartedAt >= VOICE_MIN_DURATION_MS
-        // stop() throws when no valid data was captured (e.g. released
-        // immediately); treat that the same as a too-short press.
-        val stopped = runCatching { recorder.stop() }.isSuccess
-        recorder.release()
-        val file = voiceRecordingFile()
-        if (!send || !stopped || !longEnough) {
-            if (send) {
-                Toast.makeText(this, R.string.voice_too_short, Toast.LENGTH_SHORT).show()
-            }
-            file.delete()
-            return
-        }
-        val audio = file.readBytes()
-        file.delete()
-        runVoiceFilter(audio)
-    }
-
-    private fun runVoiceFilter(audio: ByteArray) {
-        val command = voiceFilterCommand() ?: return
-        val svc = service
-        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
-            Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
-            return
-        }
-        voiceFilterRunning = true
-        binding.swipeFeedback.text = getString(R.string.voice_transcribing)
-        binding.swipeFeedback.visibility = View.VISIBLE
-        svc.execCommandForOutput(command, audio, VOICE_FILTER_TIMEOUT_MS) { result ->
-            voiceFilterRunning = false
-            binding.swipeFeedback.visibility = View.GONE
-            result.fold(
-                onSuccess = { exec -> onVoiceFilterDone(exec) },
-                onFailure = { e ->
-                    Toast.makeText(
-                        this,
-                        getString(R.string.voice_filter_failed, e.message ?: e.javaClass.simpleName),
-                        Toast.LENGTH_LONG,
-                    ).show()
-                },
-            )
-        }
-    }
-
-    private fun onVoiceFilterDone(exec: SshSession.ExecResult) {
-        // Trailing newlines would submit the line in the terminal; inserting
-        // must never do more than typing would.
-        val text = exec.stdout.trimEnd('\n', '\r')
-        if (exec.exitStatus != 0 || text.isEmpty()) {
-            val reason = exec.stderr.trim().lines().lastOrNull { it.isNotBlank() }
-                ?: "exit ${exec.exitStatus}"
-            Toast.makeText(
-                this,
-                getString(R.string.voice_filter_failed, reason),
-                Toast.LENGTH_LONG,
-            ).show()
-            return
-        }
-        showVoiceResultDialog(text)
-    }
-
-    /**
-     * Show the filter output for review before insertion — recognition errors
-     * must not flow into the terminal unseen. The text is editable so small
-     * fixes don't require re-recording.
-     */
-    private fun showVoiceResultDialog(text: String) {
-        val edit = EditText(this).apply {
-            setText(text)
-            setSelection(length())
-        }
-        val pad = dpToPx(16)
-        val container = FrameLayout(this).apply {
-            setPadding(pad, pad / 2, pad, 0)
-            addView(edit)
-        }
-        AlertDialog.Builder(this)
-            .setTitle(R.string.voice_result_title)
-            .setView(container)
-            .setPositiveButton(R.string.voice_insert) { _, _ ->
-                val finalText = edit.text.toString()
-                if (finalText.isNotEmpty()) {
-                    writeToSsh(finalText.toByteArray(Charsets.UTF_8))
-                }
-                binding.imeProxy.requestFocus()
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
 
     private fun voiceRecordingFile(): File = File(cacheDir, "voice-input.ogg")
 
@@ -2969,9 +2805,8 @@ class TerminalActivity : AppCompatActivity() {
         // are wiped automatically on reboot — no explicit cleanup is needed.
         private const val REMOTE_TMP_DIR = "/tmp"
 
-        // Voice input: presses shorter than this are accidental taps, and the
-        // filter timeout allows for a slow CPU-bound transcription remote-side.
-        private const val VOICE_MIN_DURATION_MS = 400L
+        // Voice input: the filter timeout allows for a slow CPU-bound
+        // transcription remote-side.
         private const val VOICE_FILTER_TIMEOUT_MS = 120_000L
 
         // Conversation mode. VAD thresholds: MediaRecorder.getMaxAmplitude is
