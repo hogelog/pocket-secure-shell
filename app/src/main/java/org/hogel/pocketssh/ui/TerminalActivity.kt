@@ -1234,13 +1234,12 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Voice input is a generic primitive — pss knows nothing about speech
-     * recognition. Recordings are piped to the stdin of a user-configured
-     * remote filter command whose stdout is inserted as typed input, and the
-     * reply command's stdout is read aloud. Engine, vocabulary, and any
-     * post-processing live entirely in those remote commands. One-shot
-     * dictation is deliberately not offered: the IME's voice typing already
-     * covers it.
+     * Conversation mode. Speech is recognized on-device; each recognized
+     * utterance is sent as typed input, then the user-configured reply
+     * command's stdout is read aloud with the device TTS. pss knows nothing
+     * about the conversation itself — vocabulary and any post-processing live
+     * entirely in that remote command. One-shot dictation is deliberately not
+     * offered: the IME's voice typing already covers it.
      */
     private fun setupVoiceButton() {
         binding.btnVoice.setOnClickListener {
@@ -2816,10 +2815,6 @@ class TerminalActivity : AppCompatActivity() {
         // Picked images are uploaded under /tmp on the remote host so they
         // are wiped automatically on reboot — no explicit cleanup is needed.
         private const val REMOTE_TMP_DIR = "/tmp"
-
-        // Voice input: the filter timeout allows for a slow CPU-bound
-        // transcription remote-side.
-        private const val VOICE_FILTER_TIMEOUT_MS = 120_000L
 
         // Conversation mode. The on-device recognizer does its own endpointing,
         // so the only tuning left is how fast to re-arm after a pass ends: a

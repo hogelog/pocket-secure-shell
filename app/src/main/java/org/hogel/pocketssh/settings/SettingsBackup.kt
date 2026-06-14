@@ -46,8 +46,6 @@ object SettingsBackup {
             prefs.getString(MainActivity.KEY_USERNAME, null)?.let { put("username", it) }
             put("use_tmux", prefs.getBoolean(MainActivity.KEY_USE_TMUX, true))
             prefs.getString(MainActivity.KEY_TMUX_PREFIX, null)?.let { put("tmux_prefix", it) }
-            prefs.getString(MainActivity.KEY_VOICE_FILTER_COMMAND, null)
-                ?.takeIf { it.isNotBlank() }?.let { put("voice_filter_command", it) }
             prefs.getString(MainActivity.KEY_VOICE_REPLY_COMMAND, null)
                 ?.takeIf { it.isNotBlank() }?.let { put("voice_reply_command", it) }
         }
@@ -101,9 +99,6 @@ object SettingsBackup {
                 connection.username?.let { putString(MainActivity.KEY_USERNAME, it) }
                 connection.useTmux?.let { putBoolean(MainActivity.KEY_USE_TMUX, it) }
                 connection.tmuxPrefix?.let { putString(MainActivity.KEY_TMUX_PREFIX, it) }
-                connection.voiceFilterCommand?.let {
-                    putString(MainActivity.KEY_VOICE_FILTER_COMMAND, it)
-                }
                 connection.voiceReplyCommand?.let {
                     putString(MainActivity.KEY_VOICE_REPLY_COMMAND, it)
                 }
@@ -131,7 +126,6 @@ object SettingsBackup {
         val username: String?,
         val useTmux: Boolean?,
         val tmuxPrefix: String?,
-        val voiceFilterCommand: String?,
         val voiceReplyCommand: String?,
     )
 
@@ -141,7 +135,6 @@ object SettingsBackup {
         username = if (obj.has("username")) obj.getString("username") else null,
         useTmux = if (obj.has("use_tmux")) obj.getBoolean("use_tmux") else null,
         tmuxPrefix = if (obj.has("tmux_prefix")) obj.getString("tmux_prefix") else null,
-        voiceFilterCommand = if (obj.has("voice_filter_command")) obj.getString("voice_filter_command") else null,
         voiceReplyCommand = if (obj.has("voice_reply_command")) obj.getString("voice_reply_command") else null,
     )
 

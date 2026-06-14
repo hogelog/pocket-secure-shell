@@ -81,11 +81,7 @@
     <string name="voice_transcribing">Transcribing…</string>
     <string name="voice_not_connected">Not connected</string>
     <string name="voice_permission_denied">Microphone permission denied</string>
-    <string name="voice_record_failed">Recording failed: %1$s</string>
-    <string name="voice_filter_failed">Voice filter failed: %1$s</string>
-    <string name="voice_filter_command">Voice input filter</string>
-    <string name="voice_filter_command_value_off">Off</string>
-    <string name="voice_filter_command_dialog_message">Remote command for voice input. It receives the recorded audio (Ogg/Opus) on stdin; its stdout is inserted into the terminal. Leave empty to disable the mic button.</string>
+    <string name="voice_reply_command_value_off">Off</string>
     <string name="voice_reply_command">Voice reply command</string>
     <string name="voice_reply_command_dialog_message">Remote command run after each utterance in conversation mode; its stdout is read aloud with the device TTS. Tap the mic button to enter conversation mode (hands-free loop: speak → send → listen to the reply → speak). Leave empty to disable.</string>
     <string name="voice_mode_listening">● Listening…</string>

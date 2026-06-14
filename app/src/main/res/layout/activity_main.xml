@@ -313,39 +313,10 @@
                 android:visibility="gone" />
 
             <LinearLayout
-                android:id="@+id/row_voice_filter"
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="20dp"
-                android:background="?attr/selectableItemBackground"
-                android:gravity="center_vertical"
-                android:minHeight="48dp"
-                android:orientation="vertical">
-
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:letterSpacing="0.05"
-                    android:text="@string/voice_filter_command"
-                    android:textAppearance="?attr/textAppearanceLabelLarge"
-                    android:textColor="?attr/colorPrimary" />
-
-                <TextView
-                    android:id="@+id/text_voice_filter_value"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:ellipsize="middle"
-                    android:singleLine="true"
-                    android:textAppearance="?attr/textAppearanceBodySmall"
-                    android:textColor="?attr/colorOnSurfaceVariant"
-                    tools:text="voice-to-text" />
-            </LinearLayout>
-
-            <LinearLayout
                 android:id="@+id/row_voice_reply"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:layout_marginTop="12dp"
+                android:layout_marginTop="20dp"
                 android:background="?attr/selectableItemBackground"
                 android:gravity="center_vertical"
                 android:minHeight="48dp"

@@ -159,8 +159,8 @@ class SshConnectionService : Service() {
         Thread(r, "ssh-scp").apply { isDaemon = true }
     }
 
-    // Voice filter / reply commands get their own executor: a conversation-mode
-    // reply wait can block for minutes and must not stall SCP transfers.
+    // The conversation-mode reply command gets its own executor: a reply wait
+    // can block for minutes and must not stall SCP transfers.
     private val voiceExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "ssh-voice").apply { isDaemon = true }
     }
@@ -693,9 +693,8 @@ class SshConnectionService : Service() {
 
     /**
      * Run [command] on a separate exec channel, feeding [input] to its stdin
-     * and capturing its output (used by voice input to pipe a recording
-     * through the configured filter command, and to wait for conversation-mode
-     * replies). Runs on [voiceExecutor]; [onResult] is posted on the main
+     * and capturing its output (used by conversation mode to wait for the
+     * reply command). Runs on [voiceExecutor]; [onResult] is posted on the main
      * thread with the exec result or the failure.
      */
     fun execCommandForOutput(
@@ -716,7 +715,7 @@ class SshConnectionService : Service() {
         }
     }
 
-    /** Abort the in-flight voice filter/reply exec (if any). */
+    /** Abort the in-flight conversation-mode reply exec (if any). */
     fun cancelVoiceExec() {
         session?.cancelExecCommandForOutput()
     }

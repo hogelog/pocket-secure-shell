@@ -107,7 +107,7 @@ class MainActivity : AppCompatActivity() {
         setupTmuxPrefixRow()
         setupTmuxToggle()
         setupShortcutsRow()
-        setupVoiceFilterRow()
+        setupVoiceReplyRow()
 
         updatePublicKeyDisplay()
 
@@ -536,15 +536,8 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun setupVoiceFilterRow() {
+    private fun setupVoiceReplyRow() {
         updateVoiceCommandSummaries()
-        binding.rowVoiceFilter.setOnClickListener {
-            showVoiceCommandDialog(
-                KEY_VOICE_FILTER_COMMAND,
-                R.string.voice_filter_command,
-                R.string.voice_filter_command_dialog_message,
-            )
-        }
         binding.rowVoiceReply.setOnClickListener {
             showVoiceCommandDialog(
                 KEY_VOICE_REPLY_COMMAND,
@@ -555,11 +548,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateVoiceCommandSummaries() {
-        fun summary(key: String): String =
-            prefs.getString(key, null)?.trim().orEmpty()
-                .ifEmpty { getString(R.string.voice_filter_command_value_off) }
-        binding.textVoiceFilterValue.text = summary(KEY_VOICE_FILTER_COMMAND)
-        binding.textVoiceReplyValue.text = summary(KEY_VOICE_REPLY_COMMAND)
+        val value = prefs.getString(KEY_VOICE_REPLY_COMMAND, null)?.trim().orEmpty()
+            .ifEmpty { getString(R.string.voice_reply_command_value_off) }
+        binding.textVoiceReplyValue.text = value
     }
 
     private fun showVoiceCommandDialog(key: String, titleRes: Int, messageRes: Int) {
@@ -621,7 +612,6 @@ class MainActivity : AppCompatActivity() {
         internal const val KEY_USERNAME = "username"
         internal const val KEY_USE_TMUX = "use_tmux"
         internal const val KEY_TMUX_PREFIX = "tmux_prefix"
-        internal const val KEY_VOICE_FILTER_COMMAND = "voice_filter_command"
         internal const val KEY_VOICE_REPLY_COMMAND = "voice_reply_command"
         private const val DEFAULT_TMUX_PREFIX = "b"
         // Experimental tmux control-mode (`tmux -CC`) opt-in. Debug builds only;
