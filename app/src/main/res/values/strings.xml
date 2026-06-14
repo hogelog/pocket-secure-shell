@@ -81,7 +81,7 @@
     <string name="voice_not_connected">Not connected</string>
     <string name="voice_permission_denied">Microphone permission denied</string>
     <string name="voice_helper_install_title">Set up voice replies</string>
-    <string name="voice_helper_install_message">Conversation mode installs a small helper script on this server (under ~/.pocketssh) so it can speak each reply aloud. Install it now?</string>
+    <string name="voice_helper_install_message">Conversation mode installs a small helper script on this server (under ~/.local/share/pocketssh) so it can speak each reply aloud. Install it now?</string>
     <string name="voice_helper_installing">Installing voice helper…</string>
     <string name="voice_helper_install_failed">Couldn\'t install the voice helper</string>
     <string name="voice_mode_listening">● Listening…</string>

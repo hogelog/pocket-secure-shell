@@ -2853,14 +2853,16 @@ class TerminalActivity : AppCompatActivity() {
         private const val VOICE_REPLY_TIMEOUT_MS = 660_000L
 
         // Conversation mode's reply command is pss's own bundled helper
-        // (res/raw/voice_reply_wait), installed under the user's home on first
+        // (res/raw/voice_reply_wait), installed under the XDG data dir on first
         // use. Bumping VOICE_HELPER_VERSION re-pushes it on the next entry; the
         // installed version is tracked in KEY_VOICE_HELPER_VERSION. The helper
         // and the server-side hook share the spool contract under ~/.cache.
-        private const val VOICE_HELPER_PATH = "~/.pocketssh/voice-reply-wait"
+        // The shell expands $XDG_DATA_HOME/$HOME remote-side.
+        private const val VOICE_HELPER_DIR = "\${XDG_DATA_HOME:-\$HOME/.local/share}/pocketssh"
+        private const val VOICE_HELPER_PATH = "$VOICE_HELPER_DIR/voice-reply-wait"
         private const val VOICE_REPLY_HELPER_CMD = VOICE_HELPER_PATH
         private const val VOICE_HELPER_INSTALL_CMD =
-            "mkdir -p ~/.pocketssh && cat > $VOICE_HELPER_PATH && chmod 755 $VOICE_HELPER_PATH"
+            "mkdir -p $VOICE_HELPER_DIR && cat > $VOICE_HELPER_PATH && chmod 755 $VOICE_HELPER_PATH"
         private const val VOICE_HELPER_INSTALL_TIMEOUT_MS = 10_000L
         private const val VOICE_HELPER_VERSION = 1
         private const val KEY_VOICE_HELPER_VERSION = "voice_helper_version"

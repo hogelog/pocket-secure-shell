@@ -2,7 +2,8 @@
 # pss voice conversation mode の reply command。
 #
 # pss が会話モード開始時にこのスクリプトをリモートへ自動インストールして
-# (~/.pocketssh/voice-reply-wait)、各発話のあと exec する。pss 側で内容を
+# ($XDG_DATA_HOME/pocketssh/voice-reply-wait, 既定 ~/.local/share/...)、各
+# 発話のあと exec する。pss 側で内容を
 # 所有するので、利用者が設定で用意する必要はない。spool の規約 (パス・
 # ファイル名・マーカー命名) が pss とサーバ側フック (yobidashi-turn-notify)
 # の契約。
