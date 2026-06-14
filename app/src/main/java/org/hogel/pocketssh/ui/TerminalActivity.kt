@@ -1436,17 +1436,6 @@ class TerminalActivity : AppCompatActivity() {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-            // Let a mid-thought pause ride: hint a longer end-of-speech silence
-            // before the engine finalizes, so a brief breath doesn't cut the
-            // utterance short. These are hints — some engines ignore them.
-            putExtra(
-                RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
-                VOICE_END_SILENCE_MS,
-            )
-            putExtra(
-                RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
-                VOICE_END_SILENCE_MS,
-            )
         }
 
     private fun onRecognizedText(raw: String) {
@@ -2880,9 +2869,6 @@ class TerminalActivity : AppCompatActivity() {
         // above the remote waiter's own 600 s timeout so the remote side decides.
         private const val RECOGNIZER_RESTART_MS = 300L
         private const val RECOGNIZER_BUSY_RETRY_MS = 600L
-        // End-of-speech silence the recognizer should wait through before
-        // finalizing, so short mid-utterance pauses don't submit early.
-        private const val VOICE_END_SILENCE_MS = 2_000
         // Gap between the recognized text and its submitting Enter, so a
         // paste-coalescing TUI sees the CR as a discrete keypress, not as part
         // of the pasted utterance.
