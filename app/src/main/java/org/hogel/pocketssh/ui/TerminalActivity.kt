@@ -1448,17 +1448,28 @@ class TerminalActivity : AppCompatActivity() {
             armListening()
             return
         }
-        writeToSsh(text.toByteArray(Charsets.UTF_8))
         Toast.makeText(this, getString(R.string.voice_sent_format, text), Toast.LENGTH_LONG).show()
-        // Submit with a separate, slightly delayed Enter. Glued to the text the
-        // CR rides the same input burst, and a TUI that reads a fast burst as a
-        // paste (e.g. Claude Code) folds it in as a literal newline instead of
-        // submitting. The gap lets the paste settle so Enter lands on its own.
-        voiceHandler.postDelayed({
-            if (voiceConversation != VoiceConversation.LISTENING) return@postDelayed
+        // Submit the utterance, then Enter. The CR must not ride the same input
+        // burst as the text, or a TUI that coalesces the burst as a paste (e.g.
+        // Claude Code) folds it into the composer as a literal newline instead
+        // of submitting. With bracketed paste on, the end marker delimits the
+        // text so the following Enter is unambiguous and length-independent;
+        // otherwise fall back to sending Enter after a short delay — which a
+        // long utterance can outrun, hence the bracketed path is preferred.
+        if (isBracketedPasteActive()) {
+            writeToSsh(BRACKETED_PASTE_START)
+            writeToSsh(text.toByteArray(Charsets.UTF_8))
+            writeToSsh(BRACKETED_PASTE_END)
             writeToSsh("\r".toByteArray(Charsets.UTF_8))
             waitForVoiceReply()
-        }, VOICE_SUBMIT_ENTER_DELAY_MS)
+        } else {
+            writeToSsh(text.toByteArray(Charsets.UTF_8))
+            voiceHandler.postDelayed({
+                if (voiceConversation != VoiceConversation.LISTENING) return@postDelayed
+                writeToSsh("\r".toByteArray(Charsets.UTF_8))
+                waitForVoiceReply()
+            }, VOICE_SUBMIT_ENTER_DELAY_MS)
+        }
     }
 
     private fun onRecognizerError(error: Int) {
