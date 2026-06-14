@@ -2856,15 +2856,16 @@ class TerminalActivity : AppCompatActivity() {
         // (res/raw/voice_reply_wait), installed under the XDG data dir on first
         // use. Bumping VOICE_HELPER_VERSION re-pushes it on the next entry; the
         // installed version is tracked in KEY_VOICE_HELPER_VERSION. The helper
-        // and the server-side hook share the spool contract under ~/.cache.
-        // The shell expands $XDG_DATA_HOME/$HOME remote-side.
+        // and the server-side hook share the spool contract under the XDG cache
+        // dir (~/.cache/pocketssh/voice-reply-spool). The shell expands
+        // $XDG_DATA_HOME/$HOME remote-side.
         private const val VOICE_HELPER_DIR = "\${XDG_DATA_HOME:-\$HOME/.local/share}/pocketssh"
         private const val VOICE_HELPER_PATH = "$VOICE_HELPER_DIR/voice-reply-wait"
         private const val VOICE_REPLY_HELPER_CMD = VOICE_HELPER_PATH
         private const val VOICE_HELPER_INSTALL_CMD =
             "mkdir -p $VOICE_HELPER_DIR && cat > $VOICE_HELPER_PATH && chmod 755 $VOICE_HELPER_PATH"
         private const val VOICE_HELPER_INSTALL_TIMEOUT_MS = 10_000L
-        private const val VOICE_HELPER_VERSION = 1
+        private const val VOICE_HELPER_VERSION = 2
         private const val KEY_VOICE_HELPER_VERSION = "voice_helper_version"
         // State earcons: a rising double beep means "your turn to speak"; a
         // single ack means "sent, waiting for the reply". Kept distinct so the

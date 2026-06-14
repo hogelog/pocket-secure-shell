@@ -21,7 +21,7 @@
 # タイムアウト (default 600s) で exit 1 — pss は何も読み上げず聞き取りに戻る。
 set -euo pipefail
 
-SPOOL=~/.cache/voice-reply-spool
+SPOOL="${XDG_CACHE_HOME:-$HOME/.cache}/pocketssh/voice-reply-spool"
 TIMEOUT="${VOICE_REPLY_TIMEOUT:-600}"
 
 mkdir -p "$SPOOL"
