@@ -6,6 +6,12 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <!-- Conversation mode keeps capturing speech (microphone) and reading
+         replies aloud (mediaPlayback) while the app is backgrounded, like a
+         call app. The foreground service is promoted to these types only while
+         conversation mode is active. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <!-- Make the system speech-recognition service visible under package
          visibility (Android 11+) so SpeechRecognizer can bind to it. -->
@@ -88,7 +94,7 @@
         <service
             android:name=".ssh.SshConnectionService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse|microphone|mediaPlayback">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="Maintain interactive SSH session while the app is in the background" />

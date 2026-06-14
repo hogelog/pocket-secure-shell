@@ -53,6 +53,13 @@ class SshConnectionService : Service() {
         fun onWindowsChanged(windows: List<TmuxControlWindow>)
     }
 
+    /** Lets the conversation-mode notification's "End conversation" action reach
+     *  the activity that owns the loop (recognizer + TTS), since the service only
+     *  holds the microphone foreground type, not the loop itself. */
+    interface VoiceListener {
+        fun onVoiceStopRequested()
+    }
+
     inner class LocalBinder : Binder() {
         fun getService(): SshConnectionService = this@SshConnectionService
     }
@@ -120,6 +127,15 @@ class SshConnectionService : Service() {
     @Volatile
     private var controlClient: TmuxControlClient? = null
     private var controlListener: TmuxControlListener? = null
+
+    @Volatile
+    private var voiceListener: VoiceListener? = null
+
+    // Whether the foreground service is currently promoted to hold the
+    // microphone (+ media playback) for conversation mode. Drives the
+    // notification's title/action and which foreground type we re-assert.
+    @Volatile
+    private var voiceForegroundActive = false
 
     // Client size to report to tmux in control mode (a control client has no
     // usable tty size). Sent with the first list-windows — after
@@ -190,6 +206,15 @@ class SshConnectionService : Service() {
         }
         if (intent?.action == ACTION_CANCEL_UPLOAD) {
             cancelUpload()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_STOP_VOICE) {
+            // The activity owns the loop, so ask it to exit cleanly (it will
+            // demote the foreground type via stopVoiceForeground). If it is gone,
+            // demote ourselves so the microphone type doesn't linger.
+            val listener = voiceListener
+            if (listener != null) mainHandler.post { listener.onVoiceStopRequested() }
+            else stopVoiceForeground()
             return START_NOT_STICKY
         }
         ServiceCompat.startForeground(
@@ -720,6 +745,45 @@ class SshConnectionService : Service() {
         session?.cancelExecCommandForOutput()
     }
 
+    fun setVoiceListener(listener: VoiceListener?) {
+        voiceListener = listener
+    }
+
+    /**
+     * Promote the foreground service to hold the microphone (and media playback
+     * for the reply TTS) so conversation mode keeps capturing speech and reading
+     * replies aloud while the app is backgrounded or the screen is off — like a
+     * call app. Must be called while the app is in the foreground (conversation
+     * mode is always entered from the visible activity), which Android requires
+     * for starting a microphone-typed foreground service. The notification
+     * switches to a "Conversation mode" title with an "End conversation" action.
+     */
+    fun startVoiceForeground() {
+        voiceForegroundActive = true
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            buildNotification(currentStatusText(), voice = true),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+        )
+    }
+
+    /** Drop the microphone/media-playback foreground type when conversation mode
+     *  exits, reverting to the plain SSH-session foreground. No-op if it was
+     *  never promoted. */
+    fun stopVoiceForeground() {
+        if (!voiceForegroundActive) return
+        voiceForegroundActive = false
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            buildNotification(currentStatusText(), voice = false),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+        )
+    }
+
     /**
      * List remote directory [path] via SFTP for the file browser. [onResult] is
      * invoked on the main thread with the resolved absolute path and entries on
@@ -906,7 +970,16 @@ class SshConnectionService : Service() {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    private fun buildNotification(text: String): Notification {
+    /** Notification text for the current connection state, reused when the
+     *  voice foreground is (de)promoted without a fresh status callback. */
+    private fun currentStatusText(): String =
+        if (state == State.CONNECTED && connectionLabel.isNotEmpty()) {
+            getString(R.string.notification_text_connected, connectionLabel)
+        } else {
+            getString(R.string.notification_text_connecting)
+        }
+
+    private fun buildNotification(text: String, voice: Boolean = voiceForegroundActive): Notification {
         val openIntent = PendingIntent.getActivity(
             this,
             0,
@@ -921,16 +994,28 @@ class SshConnectionService : Service() {
             Intent(this, SshConnectionService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification_terminal)
-            .setContentTitle(getString(R.string.notification_title))
+            .setContentTitle(
+                if (voice) getString(R.string.notification_voice_title)
+                else getString(R.string.notification_title),
+            )
             .setContentText(text)
             .setOngoing(true)
             .setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setContentIntent(openIntent)
-            .addAction(0, getString(R.string.notification_action_disconnect), stopIntent)
-            .build()
+        if (voice) {
+            val stopVoiceIntent = PendingIntent.getService(
+                this,
+                2,
+                Intent(this, SshConnectionService::class.java).setAction(ACTION_STOP_VOICE),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            builder.addAction(0, getString(R.string.notification_action_voice_stop), stopVoiceIntent)
+        }
+        builder.addAction(0, getString(R.string.notification_action_disconnect), stopIntent)
+        return builder.build()
     }
 
     private fun updateNotification(text: String) {
@@ -1044,6 +1129,7 @@ class SshConnectionService : Service() {
     companion object {
         const val ACTION_STOP = "org.hogel.pocketssh.action.STOP_CONNECTION"
         const val ACTION_CANCEL_UPLOAD = "org.hogel.pocketssh.action.CANCEL_UPLOAD"
+        const val ACTION_STOP_VOICE = "org.hogel.pocketssh.action.STOP_VOICE"
         private const val CHANNEL_ID = "ssh_connection"
         private const val NOTIFICATION_ID = 1001
         private const val UPLOAD_NOTIFICATION_ID = 1002
