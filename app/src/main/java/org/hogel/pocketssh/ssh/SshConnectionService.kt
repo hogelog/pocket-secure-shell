@@ -159,6 +159,12 @@ class SshConnectionService : Service() {
         Thread(r, "ssh-scp").apply { isDaemon = true }
     }
 
+    // The conversation-mode reply command gets its own executor: a reply wait
+    // can block for minutes and must not stall SCP transfers.
+    private val voiceExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ssh-voice").apply { isDaemon = true }
+    }
+
     // The in-flight upload, so its notification's cancel action can interrupt
     // it without tearing down the SSH connection.
     @Volatile
@@ -686,6 +692,35 @@ class SshConnectionService : Service() {
     }
 
     /**
+     * Run [command] on a separate exec channel, feeding [input] to its stdin
+     * and capturing its output (used by conversation mode to wait for the
+     * reply command). Runs on [voiceExecutor]; [onResult] is posted on the main
+     * thread with the exec result or the failure.
+     */
+    fun execCommandForOutput(
+        command: String,
+        input: ByteArray,
+        timeoutMs: Long,
+        onResult: (Result<SshSession.ExecResult>) -> Unit,
+    ) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(Result.failure(IllegalStateException("Not connected"))) }
+            return
+        }
+        voiceExecutor.execute {
+            val result = runCatching { ssh.execCommandForOutput(command, input, timeoutMs) }
+            result.exceptionOrNull()?.let { Log.e(TAG, "execCommandForOutput failed", it) }
+            mainHandler.post { onResult(result) }
+        }
+    }
+
+    /** Abort the in-flight conversation-mode reply exec (if any). */
+    fun cancelVoiceExec() {
+        session?.cancelExecCommandForOutput()
+    }
+
+    /**
      * List remote directory [path] via SFTP for the file browser. [onResult] is
      * invoked on the main thread with the resolved absolute path and entries on
      * success, or the thrown error on failure. Runs on the same single-threaded
@@ -853,6 +888,7 @@ class SshConnectionService : Service() {
     override fun onDestroy() {
         sshWriteExecutor.shutdownNow()
         scpExecutor.shutdownNow()
+        voiceExecutor.shutdownNow()
         keepaliveExecutor.shutdownNow()
         probeExecutor.shutdownNow()
         super.onDestroy()

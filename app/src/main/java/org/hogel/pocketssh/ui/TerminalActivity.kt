@@ -12,10 +12,18 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
@@ -26,6 +34,7 @@ import android.util.Log
 import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -49,6 +58,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -57,6 +67,7 @@ import java.util.TimeZone
 import java.util.concurrent.Executors
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import org.hogel.pocketssh.MainActivity
 import org.hogel.pocketssh.R
 import org.hogel.pocketssh.databinding.ActivityTerminalBinding
 import org.hogel.pocketssh.learning.BigramStore
@@ -74,6 +85,7 @@ import org.hogel.pocketssh.ssh.HostKeyPrompt
 import org.hogel.pocketssh.ssh.RemoteListing
 import org.hogel.pocketssh.ssh.SshConnectionService
 import org.hogel.pocketssh.ssh.SshKeyManager
+import org.hogel.pocketssh.ssh.SshSession
 import org.hogel.pocketssh.tmux.TmuxControlWindow
 import org.hogel.pocketssh.tmux.TmuxTitle
 import org.hogel.pocketssh.tmux.TmuxWindow
@@ -398,6 +410,63 @@ class TerminalActivity : AppCompatActivity() {
         ActivityResultContracts.PickVisualMedia(),
     ) { uri -> if (uri != null) onImagePicked(uri) }
 
+    // Voice input (push-to-talk): permission is requested on the first press;
+    // that press only grants — the user holds again to actually record.
+    private val recordAudioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (!granted) {
+            Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Conversation mode: a hands-free loop of listen (on-device STT) →
+     * auto-send → wait for the reply command → speak its stdout via the device
+     * TTS → listen again. The mic button toggles it.
+     */
+    private enum class VoiceConversation { OFF, LISTENING, WAITING_REPLY, SPEAKING }
+
+    private var voiceConversation = VoiceConversation.OFF
+    private var voiceTts: TextToSpeech? = null
+    private var voiceTtsReady = false
+    // On-device speech-to-text drives the listen half of the loop: the
+    // recognizer reports its own end-of-speech, so there is no separate VAD or
+    // remote transcription step. It must be created and used on the main thread.
+    private var speechRecognizer: SpeechRecognizer? = null
+    private val voiceHandler = Handler(Looper.getMainLooper())
+    // Short earcons so the loop's state is audible hands-free: one cue when it
+    // is the user's turn to speak, another when an utterance was sent and a
+    // reply is pending. SPEAKING needs no cue — the TTS itself is the audio.
+    private var voiceTone: ToneGenerator? = null
+
+    private val recognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+
+        override fun onBeginningOfSpeech() {
+            if (voiceConversation == VoiceConversation.LISTENING) {
+                binding.swipeFeedback.text = getString(R.string.voice_recording)
+            }
+        }
+
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+
+        override fun onError(error: Int) = onRecognizerError(error)
+
+        override fun onResults(results: Bundle?) {
+            val text = results
+                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+                .orEmpty()
+            onRecognizedText(text)
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
     // SAF file picker for SCP upload. The chosen file is uploaded into
     // [scpUploadTargetDir], the directory the browser was showing when the
     // user tapped "Upload here".
@@ -608,6 +677,7 @@ class TerminalActivity : AppCompatActivity() {
             binding.imeProxy.requestFocus()
             toggleSoftKeyboard()
         }
+        setupVoiceButton()
         binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
         // Initial sync so the IME proxy / badge visibility match the
         // default-off state on a freshly created activity.
@@ -634,6 +704,8 @@ class TerminalActivity : AppCompatActivity() {
         // the cascade on every resume so edits take effect the moment we come
         // back, without waiting for tmux to re-emit the title OSC.
         applyContext(lastAppContext)
+        // Same for the voice commands, which are edited on the main screen.
+        updateVoiceButtonVisibility()
         maybeProbeLiveness()
     }
 
@@ -1158,6 +1230,304 @@ class TerminalActivity : AppCompatActivity() {
                 val pathRef = "$REMOTE_TMP_DIR/$filename "
                 writeToSsh(pathRef.toByteArray(Charsets.UTF_8))
             }
+        }
+    }
+
+    /**
+     * Conversation mode. Speech is recognized on-device; each recognized
+     * utterance is sent as typed input, then the user-configured reply
+     * command's stdout is read aloud with the device TTS. pss knows nothing
+     * about the conversation itself — vocabulary and any post-processing live
+     * entirely in that remote command. One-shot dictation is deliberately not
+     * offered: the IME's voice typing already covers it.
+     */
+    private fun setupVoiceButton() {
+        binding.btnVoice.setOnClickListener {
+            if (voiceConversation == VoiceConversation.OFF) {
+                enterVoiceConversation()
+            } else {
+                exitVoiceConversation()
+            }
+        }
+        updateVoiceButtonVisibility()
+    }
+
+    private fun updateVoiceButtonVisibility() {
+        // Conversation mode needs on-device speech recognition; the reply helper
+        // is installed on demand, so the button only depends on STT being there.
+        binding.btnVoice.visibility =
+            if (SpeechRecognizer.isRecognitionAvailable(this)) View.VISIBLE else View.GONE
+    }
+
+    private fun enterVoiceConversation() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        // The reply command is pss's own bundled helper, installed on the server
+        // on first use and re-pushed after an app update bumps its version.
+        val installed = terminalPrefs.getInt(KEY_VOICE_HELPER_VERSION, 0)
+        when {
+            installed >= VOICE_HELPER_VERSION -> startVoiceConversation()
+            installed == 0 -> AlertDialog.Builder(this)
+                .setTitle(R.string.voice_helper_install_title)
+                .setMessage(R.string.voice_helper_install_message)
+                .setPositiveButton(android.R.string.ok) { _, _ -> installVoiceHelper(svc) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
+            // Already consented once; a version bump re-pushes silently.
+            else -> installVoiceHelper(svc)
+        }
+    }
+
+    private fun startVoiceConversation() {
+        initVoiceTts()
+        binding.btnVoice.setColorFilter(VOICE_MODE_ACTIVE_COLOR)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Move off OFF before the first turn: startListeningTurn() guards on OFF
+        // to suppress cues fired after a mid-flight exit, which would otherwise
+        // swallow this very entry.
+        voiceConversation = VoiceConversation.LISTENING
+        startListeningTurn()
+    }
+
+    /** Push the bundled reply helper to the server over the same exec primitive
+     *  the reply wait uses, then start the loop. Records the installed version so
+     *  later entries skip the round trip until an app update bumps it. */
+    private fun installVoiceHelper(svc: SshConnectionService) {
+        val script = resources.openRawResource(R.raw.voice_reply_wait).use { it.readBytes() }
+        Toast.makeText(this, R.string.voice_helper_installing, Toast.LENGTH_SHORT).show()
+        svc.execCommandForOutput(
+            VOICE_HELPER_INSTALL_CMD, script, VOICE_HELPER_INSTALL_TIMEOUT_MS,
+        ) { result ->
+            if (result.getOrNull()?.exitStatus == 0) {
+                terminalPrefs.edit { putInt(KEY_VOICE_HELPER_VERSION, VOICE_HELPER_VERSION) }
+                startVoiceConversation()
+            } else {
+                Toast.makeText(this, R.string.voice_helper_install_failed, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun exitVoiceConversation() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        voiceConversation = VoiceConversation.OFF
+        voiceHandler.removeCallbacksAndMessages(null)
+        speechRecognizer?.let { recognizer ->
+            runCatching { recognizer.cancel() }
+            runCatching { recognizer.destroy() }
+        }
+        speechRecognizer = null
+        voiceTone?.release()
+        voiceTone = null
+        // Abort an in-flight reply exec: a stranded reply waiter would hog the
+        // voice executor and steal the next conversation's reply.
+        service?.cancelVoiceExec()
+        voiceTts?.stop()
+        binding.swipeFeedback.visibility = View.GONE
+        binding.btnVoice.clearColorFilter()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun initVoiceTts() {
+        if (voiceTts != null) return
+        // Engine and language follow the device TTS settings; replies are
+        // whatever the remote reply command prints.
+        val tts = TextToSpeech(this) { status ->
+            voiceTtsReady = status == TextToSpeech.SUCCESS
+        }
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread { resumeListeningAfterSpeech() }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                runOnUiThread { resumeListeningAfterSpeech() }
+            }
+        })
+        voiceTts = tts
+    }
+
+    private fun resumeListeningAfterSpeech() {
+        if (voiceConversation != VoiceConversation.SPEAKING) return
+        startListeningTurn()
+    }
+
+    /** Begin a fresh user turn: signal "your turn" (earcon + haptic) once, then
+     *  arm the recognizer. The cue fires only here, not on the silent re-arms a
+     *  no-speech timeout triggers, so idle waiting reads as one continuous
+     *  listen rather than a stutter of give-up/restart cycles. */
+    private fun startListeningTurn() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        playVoiceTone(TONE_LISTENING)
+        binding.btnVoice.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        armListening()
+    }
+
+    /** (Re)arm an on-device recognition pass without any cue. The recognizer
+     *  reports its own end-of-speech, so [onRecognizedText] advances the loop;
+     *  Google's engine also times out after a few seconds of pre-speech silence,
+     *  which surfaces as a benign error we just re-arm from. */
+    private fun armListening() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            exitVoiceConversation()
+            return
+        }
+        val recognizer = ensureSpeechRecognizer()
+        if (recognizer == null) {
+            Toast.makeText(this, R.string.voice_stt_unavailable, Toast.LENGTH_LONG).show()
+            exitVoiceConversation()
+            return
+        }
+        voiceConversation = VoiceConversation.LISTENING
+        binding.swipeFeedback.text = getString(R.string.voice_mode_listening)
+        binding.swipeFeedback.visibility = View.VISIBLE
+        // A fresh pass must always start from idle: cancel() clears any session
+        // a previous error left half-open, otherwise startListening throws BUSY.
+        runCatching { recognizer.cancel() }
+        try {
+            recognizer.startListening(buildRecognizerIntent())
+        } catch (e: Exception) {
+            Log.e(TAG, "startListening failed", e)
+            restartListeningSoon(RECOGNIZER_RESTART_MS)
+        }
+    }
+
+    private fun playVoiceTone(toneType: Int) {
+        val tone = voiceTone ?: runCatching {
+            ToneGenerator(AudioManager.STREAM_MUSIC, VOICE_TONE_VOLUME)
+        }.getOrNull()?.also { voiceTone = it } ?: return
+        runCatching { tone.startTone(toneType) }
+    }
+
+    private fun ensureSpeechRecognizer(): SpeechRecognizer? {
+        speechRecognizer?.let { return it }
+        // Prefer the offline engine (low latency, no network); fall back to the
+        // cloud recognizer where on-device models are unavailable.
+        val recognizer = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(this) ->
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            SpeechRecognizer.isRecognitionAvailable(this) ->
+                SpeechRecognizer.createSpeechRecognizer(this)
+            else -> return null
+        }
+        recognizer.setRecognitionListener(recognitionListener)
+        speechRecognizer = recognizer
+        return recognizer
+    }
+
+    private fun buildRecognizerIntent(): Intent =
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+            )
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+
+    private fun onRecognizedText(raw: String) {
+        if (voiceConversation != VoiceConversation.LISTENING) return
+        // Auto-send must stay a single line: an embedded newline would submit
+        // more than the one utterance.
+        val text = raw.replace(Regex("[\r\n]+"), " ").trim()
+        if (text.isEmpty()) {
+            // Heard nothing usable: re-arm silently, still the same turn.
+            armListening()
+            return
+        }
+        Toast.makeText(this, getString(R.string.voice_sent_format, text), Toast.LENGTH_LONG).show()
+        // Submit the utterance, then Enter. The CR must not ride the same input
+        // burst as the text, or a TUI that coalesces the burst as a paste (e.g.
+        // Claude Code) folds it into the composer as a literal newline instead
+        // of submitting. With bracketed paste on, the end marker delimits the
+        // text so the following Enter is unambiguous and length-independent;
+        // otherwise fall back to sending Enter after a short delay — which a
+        // long utterance can outrun, hence the bracketed path is preferred.
+        if (isBracketedPasteActive()) {
+            writeToSsh(BRACKETED_PASTE_START)
+            writeToSsh(text.toByteArray(Charsets.UTF_8))
+            writeToSsh(BRACKETED_PASTE_END)
+            writeToSsh("\r".toByteArray(Charsets.UTF_8))
+            waitForVoiceReply()
+        } else {
+            writeToSsh(text.toByteArray(Charsets.UTF_8))
+            voiceHandler.postDelayed({
+                if (voiceConversation != VoiceConversation.LISTENING) return@postDelayed
+                writeToSsh("\r".toByteArray(Charsets.UTF_8))
+                waitForVoiceReply()
+            }, VOICE_SUBMIT_ENTER_DELAY_MS)
+        }
+    }
+
+    private fun onRecognizerError(error: Int) {
+        if (voiceConversation != VoiceConversation.LISTENING) return
+        // Silence, no match, and transient busy/client churn are all expected
+        // in a hands-free loop — re-arm rather than dropping out of the mode.
+        val delay = when (error) {
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> RECOGNIZER_BUSY_RETRY_MS
+            SpeechRecognizer.ERROR_NO_MATCH,
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
+            SpeechRecognizer.ERROR_CLIENT -> RECOGNIZER_RESTART_MS
+            else -> {
+                Log.w(TAG, "Speech recognizer error $error")
+                RECOGNIZER_RESTART_MS
+            }
+        }
+        restartListeningSoon(delay)
+    }
+
+    private fun restartListeningSoon(delayMs: Long) {
+        voiceHandler.postDelayed({
+            if (voiceConversation == VoiceConversation.LISTENING) armListening()
+        }, delayMs)
+    }
+
+    private fun waitForVoiceReply() {
+        val svc = service
+        if (svc == null) {
+            exitVoiceConversation()
+            return
+        }
+        voiceConversation = VoiceConversation.WAITING_REPLY
+        // Cue the handoff: utterance sent, now waiting on the reply.
+        playVoiceTone(TONE_WAITING)
+        binding.swipeFeedback.text = getString(R.string.voice_mode_waiting)
+        svc.execCommandForOutput(VOICE_REPLY_HELPER_CMD, ByteArray(0), VOICE_REPLY_TIMEOUT_MS) { result ->
+            if (voiceConversation != VoiceConversation.WAITING_REPLY) return@execCommandForOutput
+            val reply = result.getOrNull()
+                ?.takeIf { it.exitStatus == 0 }
+                ?.stdout?.trim().orEmpty()
+            if (reply.isEmpty()) {
+                // Timeout or failure: the loop should survive a missed reply —
+                // hand the turn back with the usual "your turn" cue.
+                startListeningTurn()
+            } else {
+                speakVoiceReply(reply)
+            }
+        }
+    }
+
+    private fun speakVoiceReply(reply: String) {
+        voiceConversation = VoiceConversation.SPEAKING
+        binding.swipeFeedback.text = reply
+        val tts = voiceTts
+        if (tts == null || !voiceTtsReady ||
+            tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "voice-reply") != TextToSpeech.SUCCESS
+        ) {
+            resumeListeningAfterSpeech()
         }
     }
 
@@ -2259,6 +2629,9 @@ class TerminalActivity : AppCompatActivity() {
         hostKeyResultQueue = null
         hostKeyDialog?.dismiss()
         hostKeyDialog = null
+        exitVoiceConversation()
+        voiceTts?.shutdown()
+        voiceTts = null
         scpBrowserDialog?.dismiss()
         scpBrowserDialog = null
         scpTransferDialog?.dismiss()
@@ -2488,6 +2861,42 @@ class TerminalActivity : AppCompatActivity() {
         // Picked images are uploaded under /tmp on the remote host so they
         // are wiped automatically on reboot — no explicit cleanup is needed.
         private const val REMOTE_TMP_DIR = "/tmp"
+
+        // Conversation mode. The on-device recognizer does its own endpointing,
+        // so the only tuning left is how fast to re-arm after a pass ends: a
+        // short pause after no-match/silence, a longer one after BUSY so a
+        // still-tearing-down session has time to free up. The reply timeout sits
+        // above the remote waiter's own 600 s timeout so the remote side decides.
+        private const val RECOGNIZER_RESTART_MS = 300L
+        private const val RECOGNIZER_BUSY_RETRY_MS = 600L
+        // Gap between the recognized text and its submitting Enter, so a
+        // paste-coalescing TUI sees the CR as a discrete keypress, not as part
+        // of the pasted utterance.
+        private const val VOICE_SUBMIT_ENTER_DELAY_MS = 200L
+        private const val VOICE_REPLY_TIMEOUT_MS = 660_000L
+
+        // Conversation mode's reply command is pss's own bundled helper
+        // (res/raw/voice_reply_wait), installed under the XDG data dir on first
+        // use. Bumping VOICE_HELPER_VERSION re-pushes it on the next entry; the
+        // installed version is tracked in KEY_VOICE_HELPER_VERSION. The helper
+        // and the server-side hook share the spool contract under the XDG cache
+        // dir (~/.cache/pocketssh/voice-reply-spool). The shell expands
+        // $XDG_DATA_HOME/$HOME remote-side.
+        private const val VOICE_HELPER_DIR = "\${XDG_DATA_HOME:-\$HOME/.local/share}/pocketssh"
+        private const val VOICE_HELPER_PATH = "$VOICE_HELPER_DIR/voice-reply-wait"
+        private const val VOICE_REPLY_HELPER_CMD = VOICE_HELPER_PATH
+        private const val VOICE_HELPER_INSTALL_CMD =
+            "mkdir -p $VOICE_HELPER_DIR && cat > $VOICE_HELPER_PATH && chmod 755 $VOICE_HELPER_PATH"
+        private const val VOICE_HELPER_INSTALL_TIMEOUT_MS = 10_000L
+        private const val VOICE_HELPER_VERSION = 2
+        private const val KEY_VOICE_HELPER_VERSION = "voice_helper_version"
+        // State earcons: a rising double beep means "your turn to speak"; a
+        // single ack means "sent, waiting for the reply". Kept distinct so the
+        // loop's state is recognizable by ear alone.
+        private const val VOICE_TONE_VOLUME = 80
+        private const val TONE_LISTENING = ToneGenerator.TONE_PROP_BEEP2
+        private const val TONE_WAITING = ToneGenerator.TONE_PROP_ACK
+        private val VOICE_MODE_ACTIVE_COLOR = 0xFFEF5350.toInt()
 
         // Number of learned candidates to render in the suggestions row. Sized
         // a touch under the always row's eight buttons so the learned row
