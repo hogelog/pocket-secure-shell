@@ -50,6 +50,8 @@
     <string name="notification_text_connecting">Connecting…</string>
     <string name="notification_text_connected">Connected to %1$s</string>
     <string name="notification_action_disconnect">Disconnect</string>
+    <string name="notification_voice_title">Conversation mode</string>
+    <string name="notification_action_voice_stop">End conversation</string>
     <string name="fab_menu">Menu</string>
     <string name="password_mode_badge_description">Password input mode (tap to exit)</string>
     <string name="keyboard_button_description">Toggle keyboard</string>

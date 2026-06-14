@@ -502,6 +502,14 @@ class TerminalActivity : AppCompatActivity() {
         }
     }
 
+    // The conversation-mode notification's "End conversation" action routes here
+    // (the service holds the mic foreground type but the activity owns the loop).
+    private val voiceListener = object : SshConnectionService.VoiceListener {
+        override fun onVoiceStopRequested() {
+            runOnUiThread { exitVoiceConversation() }
+        }
+    }
+
     private fun handleSshOutput(data: ByteArray) {
         val emulator = binding.terminalView.mEmulator ?: return
         emulator.append(data, data.size)
@@ -584,6 +592,7 @@ class TerminalActivity : AppCompatActivity() {
             service = svc
             bound = true
             svc.addStatusListener(statusListener)
+            svc.setVoiceListener(voiceListener)
             val params = pendingParams
             when {
                 svc.state == SshConnectionService.State.IDLE && params != null -> {
@@ -1289,6 +1298,11 @@ class TerminalActivity : AppCompatActivity() {
 
     private fun startVoiceConversation() {
         initVoiceTts()
+        // Promote the SSH foreground service to hold the microphone (and media
+        // playback for the reply TTS) so the loop keeps running when the app is
+        // backgrounded or the screen is off — like a call app. Entered from the
+        // visible activity, which Android requires for a mic-typed FGS start.
+        service?.startVoiceForeground()
         binding.btnVoice.setColorFilter(VOICE_MODE_ACTIVE_COLOR)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // Move off OFF before the first turn: startListeningTurn() guards on OFF
@@ -1330,6 +1344,9 @@ class TerminalActivity : AppCompatActivity() {
         // Abort an in-flight reply exec: a stranded reply waiter would hog the
         // voice executor and steal the next conversation's reply.
         service?.cancelVoiceExec()
+        // Drop the microphone/media-playback foreground type now that the loop
+        // is stopping; the SSH session keeps its own foreground.
+        service?.stopVoiceForeground()
         voiceTts?.stop()
         binding.swipeFeedback.visibility = View.GONE
         binding.btnVoice.clearColorFilter()
@@ -2641,6 +2658,7 @@ class TerminalActivity : AppCompatActivity() {
             service?.detachOutputListener()
             service?.detachControlListener()
             service?.removeStatusListener(statusListener)
+            service?.setVoiceListener(null)
             unbindService(serviceConnection)
             bound = false
             service = null
