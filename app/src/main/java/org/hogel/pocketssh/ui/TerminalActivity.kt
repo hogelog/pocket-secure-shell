@@ -1253,20 +1253,13 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private fun updateVoiceButtonVisibility() {
-        // On-device STT means the loop needs only a reply command to run.
+        // Conversation mode needs on-device speech recognition; the reply helper
+        // is installed on demand, so the button only depends on STT being there.
         binding.btnVoice.visibility =
-            if (voiceReplyCommand() != null) View.VISIBLE else View.GONE
+            if (SpeechRecognizer.isRecognitionAvailable(this)) View.VISIBLE else View.GONE
     }
 
-    /** The configured reply command, or null when conversation mode is off. */
-    private fun voiceReplyCommand(): String? =
-        getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
-            .getString(MainActivity.KEY_VOICE_REPLY_COMMAND, null)
-            ?.trim()?.takeIf { it.isNotEmpty() }
-
     private fun enterVoiceConversation() {
-        // STT now runs on-device, so only the reply command is required to loop.
-        if (voiceReplyCommand() == null) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -1278,6 +1271,23 @@ class TerminalActivity : AppCompatActivity() {
             Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
             return
         }
+        // The reply command is pss's own bundled helper, installed on the server
+        // on first use and re-pushed after an app update bumps its version.
+        val installed = terminalPrefs.getInt(KEY_VOICE_HELPER_VERSION, 0)
+        when {
+            installed >= VOICE_HELPER_VERSION -> startVoiceConversation()
+            installed == 0 -> AlertDialog.Builder(this)
+                .setTitle(R.string.voice_helper_install_title)
+                .setMessage(R.string.voice_helper_install_message)
+                .setPositiveButton(android.R.string.ok) { _, _ -> installVoiceHelper(svc) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
+            // Already consented once; a version bump re-pushes silently.
+            else -> installVoiceHelper(svc)
+        }
+    }
+
+    private fun startVoiceConversation() {
         initVoiceTts()
         binding.btnVoice.setColorFilter(VOICE_MODE_ACTIVE_COLOR)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -1286,6 +1296,24 @@ class TerminalActivity : AppCompatActivity() {
         // swallow this very entry.
         voiceConversation = VoiceConversation.LISTENING
         startListeningTurn()
+    }
+
+    /** Push the bundled reply helper to the server over the same exec primitive
+     *  the reply wait uses, then start the loop. Records the installed version so
+     *  later entries skip the round trip until an app update bumps it. */
+    private fun installVoiceHelper(svc: SshConnectionService) {
+        val script = resources.openRawResource(R.raw.voice_reply_wait).use { it.readBytes() }
+        Toast.makeText(this, R.string.voice_helper_installing, Toast.LENGTH_SHORT).show()
+        svc.execCommandForOutput(
+            VOICE_HELPER_INSTALL_CMD, script, VOICE_HELPER_INSTALL_TIMEOUT_MS,
+        ) { result ->
+            if (result.getOrNull()?.exitStatus == 0) {
+                terminalPrefs.edit { putInt(KEY_VOICE_HELPER_VERSION, VOICE_HELPER_VERSION) }
+                startVoiceConversation()
+            } else {
+                Toast.makeText(this, R.string.voice_helper_install_failed, Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun exitVoiceConversation() {
@@ -1449,9 +1477,8 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private fun waitForVoiceReply() {
-        val command = voiceReplyCommand()
         val svc = service
-        if (command == null || svc == null) {
+        if (svc == null) {
             exitVoiceConversation()
             return
         }
@@ -1459,7 +1486,7 @@ class TerminalActivity : AppCompatActivity() {
         // Cue the handoff: utterance sent, now waiting on the reply.
         playVoiceTone(TONE_WAITING)
         binding.swipeFeedback.text = getString(R.string.voice_mode_waiting)
-        svc.execCommandForOutput(command, ByteArray(0), VOICE_REPLY_TIMEOUT_MS) { result ->
+        svc.execCommandForOutput(VOICE_REPLY_HELPER_CMD, ByteArray(0), VOICE_REPLY_TIMEOUT_MS) { result ->
             if (voiceConversation != VoiceConversation.WAITING_REPLY) return@execCommandForOutput
             val reply = result.getOrNull()
                 ?.takeIf { it.exitStatus == 0 }
@@ -2824,6 +2851,19 @@ class TerminalActivity : AppCompatActivity() {
         private const val RECOGNIZER_RESTART_MS = 300L
         private const val RECOGNIZER_BUSY_RETRY_MS = 600L
         private const val VOICE_REPLY_TIMEOUT_MS = 660_000L
+
+        // Conversation mode's reply command is pss's own bundled helper
+        // (res/raw/voice_reply_wait), installed under the user's home on first
+        // use. Bumping VOICE_HELPER_VERSION re-pushes it on the next entry; the
+        // installed version is tracked in KEY_VOICE_HELPER_VERSION. The helper
+        // and the server-side hook share the spool contract under ~/.cache.
+        private const val VOICE_HELPER_PATH = "~/.pocketssh/voice-reply-wait"
+        private const val VOICE_REPLY_HELPER_CMD = VOICE_HELPER_PATH
+        private const val VOICE_HELPER_INSTALL_CMD =
+            "mkdir -p ~/.pocketssh && cat > $VOICE_HELPER_PATH && chmod 755 $VOICE_HELPER_PATH"
+        private const val VOICE_HELPER_INSTALL_TIMEOUT_MS = 10_000L
+        private const val VOICE_HELPER_VERSION = 1
+        private const val KEY_VOICE_HELPER_VERSION = "voice_helper_version"
         // State earcons: a rising double beep means "your turn to speak"; a
         // single ack means "sent, waiting for the reply". Kept distinct so the
         // loop's state is recognizable by ear alone.

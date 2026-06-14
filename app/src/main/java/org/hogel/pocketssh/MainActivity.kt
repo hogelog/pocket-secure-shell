@@ -107,7 +107,6 @@ class MainActivity : AppCompatActivity() {
         setupTmuxPrefixRow()
         setupTmuxToggle()
         setupShortcutsRow()
-        setupVoiceReplyRow()
 
         updatePublicKeyDisplay()
 
@@ -536,47 +535,6 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun setupVoiceReplyRow() {
-        updateVoiceCommandSummaries()
-        binding.rowVoiceReply.setOnClickListener {
-            showVoiceCommandDialog(
-                KEY_VOICE_REPLY_COMMAND,
-                R.string.voice_reply_command,
-                R.string.voice_reply_command_dialog_message,
-            )
-        }
-    }
-
-    private fun updateVoiceCommandSummaries() {
-        val value = prefs.getString(KEY_VOICE_REPLY_COMMAND, null)?.trim().orEmpty()
-            .ifEmpty { getString(R.string.voice_reply_command_value_off) }
-        binding.textVoiceReplyValue.text = value
-    }
-
-    private fun showVoiceCommandDialog(key: String, titleRes: Int, messageRes: Int) {
-        val edit = EditText(this).apply {
-            setText(prefs.getString(key, null).orEmpty())
-            setSelection(text.length)
-            isSingleLine = true
-            typeface = android.graphics.Typeface.MONOSPACE
-        }
-        val pad = (resources.displayMetrics.density * 24).toInt()
-        val container = FrameLayout(this).apply {
-            setPadding(pad, pad / 2, pad, 0)
-            addView(edit)
-        }
-        AlertDialog.Builder(this)
-            .setTitle(titleRes)
-            .setMessage(messageRes)
-            .setView(container)
-            .setPositiveButton(android.R.string.ok) { _, _ ->
-                prefs.edit { putString(key, edit.text.toString().trim()) }
-                updateVoiceCommandSummaries()
-            }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
-    }
-
     private fun normalizeTmuxPrefix(input: String?): String {
         val trimmed = input?.trim()?.lowercase().orEmpty()
         if (trimmed.length == 1 && trimmed[0] in 'a'..'z') return trimmed
@@ -612,7 +570,6 @@ class MainActivity : AppCompatActivity() {
         internal const val KEY_USERNAME = "username"
         internal const val KEY_USE_TMUX = "use_tmux"
         internal const val KEY_TMUX_PREFIX = "tmux_prefix"
-        internal const val KEY_VOICE_REPLY_COMMAND = "voice_reply_command"
         private const val DEFAULT_TMUX_PREFIX = "b"
         // Experimental tmux control-mode (`tmux -CC`) opt-in. Debug builds only;
         // not part of SettingsBackup. Removed once control mode is the default.

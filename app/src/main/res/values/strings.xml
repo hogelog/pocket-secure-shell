@@ -78,12 +78,12 @@
     <string name="scp_copy_cancelled">Copy cancelled</string>
     <string name="voice_button_description">Toggle voice conversation mode</string>
     <string name="voice_recording">● Recording…</string>
-    <string name="voice_transcribing">Transcribing…</string>
     <string name="voice_not_connected">Not connected</string>
     <string name="voice_permission_denied">Microphone permission denied</string>
-    <string name="voice_reply_command_value_off">Off</string>
-    <string name="voice_reply_command">Voice reply command</string>
-    <string name="voice_reply_command_dialog_message">Remote command run after each utterance in conversation mode; its stdout is read aloud with the device TTS. Tap the mic button to enter conversation mode (hands-free loop: speak → send → listen to the reply → speak). Leave empty to disable.</string>
+    <string name="voice_helper_install_title">Set up voice replies</string>
+    <string name="voice_helper_install_message">Conversation mode installs a small helper script on this server (under ~/.pocketssh) so it can speak each reply aloud. Install it now?</string>
+    <string name="voice_helper_installing">Installing voice helper…</string>
+    <string name="voice_helper_install_failed">Couldn\'t install the voice helper</string>
     <string name="voice_mode_listening">● Listening…</string>
     <string name="voice_stt_unavailable">On-device speech recognition unavailable</string>
     <string name="voice_mode_waiting">Waiting for reply…</string>
