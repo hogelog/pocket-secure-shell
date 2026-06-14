@@ -1448,9 +1448,17 @@ class TerminalActivity : AppCompatActivity() {
             armListening()
             return
         }
-        writeToSsh((text + "\r").toByteArray(Charsets.UTF_8))
+        writeToSsh(text.toByteArray(Charsets.UTF_8))
         Toast.makeText(this, getString(R.string.voice_sent_format, text), Toast.LENGTH_LONG).show()
-        waitForVoiceReply()
+        // Submit with a separate, slightly delayed Enter. Glued to the text the
+        // CR rides the same input burst, and a TUI that reads a fast burst as a
+        // paste (e.g. Claude Code) folds it in as a literal newline instead of
+        // submitting. The gap lets the paste settle so Enter lands on its own.
+        voiceHandler.postDelayed({
+            if (voiceConversation != VoiceConversation.LISTENING) return@postDelayed
+            writeToSsh("\r".toByteArray(Charsets.UTF_8))
+            waitForVoiceReply()
+        }, VOICE_SUBMIT_ENTER_DELAY_MS)
     }
 
     private fun onRecognizerError(error: Int) {
@@ -2850,6 +2858,10 @@ class TerminalActivity : AppCompatActivity() {
         // above the remote waiter's own 600 s timeout so the remote side decides.
         private const val RECOGNIZER_RESTART_MS = 300L
         private const val RECOGNIZER_BUSY_RETRY_MS = 600L
+        // Gap between the recognized text and its submitting Enter, so a
+        // paste-coalescing TUI sees the CR as a discrete keypress, not as part
+        // of the pasted utterance.
+        private const val VOICE_SUBMIT_ENTER_DELAY_MS = 200L
         private const val VOICE_REPLY_TIMEOUT_MS = 660_000L
 
         // Conversation mode's reply command is pss's own bundled helper
