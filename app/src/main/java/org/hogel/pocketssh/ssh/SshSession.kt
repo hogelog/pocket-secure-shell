@@ -1,5 +1,6 @@
 package org.hogel.pocketssh.ssh
 
+import android.os.SystemClock
 import com.trilead.ssh2.ChannelCondition
 import com.trilead.ssh2.Connection
 import com.trilead.ssh2.SFTPv3Client
@@ -304,51 +305,82 @@ class SshSession(
     /** Result of [execCommandForOutput]: remote exit status plus decoded output. */
     data class ExecResult(val exitStatus: Int, val stdout: String, val stderr: String)
 
-    // The in-flight execCommandForOutput channel, so the (possibly
-    // minutes-long) blocking read can be aborted from another thread.
+    // The in-flight execCommandForOutput is aborted cooperatively, never by
+    // closing its channel from another thread: that read blocks on a worker
+    // thread, and closing the Trilead Session from the main thread races the
+    // transport layer and occasionally tears down the whole SSH connection.
+    // Instead [cancelExecCommandForOutput] flips this flag and the reading worker
+    // observes it on its next poll tick, then closes its own channel — which
+    // makes sshd kill the remote command, so a stranded reply waiter can't steal
+    // the next reply.
     @Volatile
-    private var outputExecSession: Session? = null
+    private var outputExecCancelled = false
 
     /**
      * Like [execCommand], but feeds [input] to the remote command's stdin and
-     * captures its stdout/stderr. The reads block until the remote closes the
-     * streams, so [timeoutMs] only bounds the final exit-status wait — the
-     * remote command must consume stdin and terminate on its own (or the
-     * caller aborts via [cancelExecCommandForOutput]). Call from a background
-     * thread.
+     * captures its stdout/stderr. Reads in short polling ticks rather than one
+     * long blocking read so [cancelExecCommandForOutput] can abort it
+     * cooperatively from another thread without closing the channel underneath
+     * the read. [timeoutMs] bounds the whole read. Call from a background thread.
      */
     fun execCommandForOutput(command: String, input: ByteArray, timeoutMs: Long): ExecResult {
         val conn = connection ?: throw IllegalStateException("Not connected")
         val sess = conn.openSession()
-        outputExecSession = sess
+        outputExecCancelled = false
         try {
             sess.execCommand(command)
             sess.stdin.use { it.write(input) }
-            val stdout = sess.stdout.readBytes()
-            val stderr = sess.stderr.readBytes()
-            sess.waitForCondition(
-                ChannelCondition.EXIT_STATUS or ChannelCondition.CLOSED,
-                timeoutMs,
-            )
+            val stdout = sess.stdout
+            val stderr = sess.stderr
+            val out = java.io.ByteArrayOutputStream()
+            val err = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            val deadline = SystemClock.elapsedRealtime() + timeoutMs
+            while (true) {
+                if (outputExecCancelled) break
+                val remaining = deadline - SystemClock.elapsedRealtime()
+                if (remaining <= 0) break
+                val cond = sess.waitForCondition(
+                    ChannelCondition.STDOUT_DATA or ChannelCondition.STDERR_DATA or
+                        ChannelCondition.EOF or ChannelCondition.CLOSED,
+                    remaining.coerceAtMost(OUTPUT_EXEC_POLL_MS),
+                )
+                while (stdout.available() > 0) {
+                    val n = stdout.read(buf)
+                    if (n < 0) break
+                    out.write(buf, 0, n)
+                }
+                while (stderr.available() > 0) {
+                    val n = stderr.read(buf)
+                    if (n < 0) break
+                    err.write(buf, 0, n)
+                }
+                if (cond and (ChannelCondition.EOF or ChannelCondition.CLOSED) != 0 &&
+                    stdout.available() == 0 && stderr.available() == 0
+                ) {
+                    break
+                }
+            }
             return ExecResult(
                 sess.exitStatus ?: -1,
-                stdout.toString(Charsets.UTF_8),
-                stderr.toString(Charsets.UTF_8),
+                out.toString("UTF-8"),
+                err.toString("UTF-8"),
             )
         } finally {
-            outputExecSession = null
             try { sess.close() } catch (_: Exception) {}
         }
     }
 
     /**
-     * Abort an in-flight [execCommandForOutput] by closing its channel. The
-     * blocked reads fail over, and sshd kills the remote command on channel
-     * close — without this, leaving conversation mode would strand a reply
-     * waiter that steals the next reply.
+     * Abort an in-flight [execCommandForOutput] cooperatively. The reading worker
+     * thread sees the flag on its next poll tick and closes its own channel; sshd
+     * then kills the remote command, so leaving conversation mode can't strand a
+     * reply waiter that steals the next reply. Closing the channel here (from
+     * another thread) is deliberately avoided — it races the blocked read and can
+     * tear down the SSH transport.
      */
     fun cancelExecCommandForOutput() {
-        try { outputExecSession?.close() } catch (_: Exception) {}
+        outputExecCancelled = true
     }
 
     /** Send an SSH_MSG_IGNORE packet to keep NAT/firewall mappings warm. */
@@ -384,6 +416,9 @@ class SshSession(
         private const val KEX_TIMEOUT_MS = 30_000
         private const val TMUX_SESSION_NAME = "pocketssh"
         private const val UPLOAD_CHUNK_BYTES = 128 * 1024
+        // How long each execCommandForOutput read tick blocks before re-checking
+        // the cooperative cancel flag; small enough that aborting feels instant.
+        private const val OUTPUT_EXEC_POLL_MS = 200L
     }
 }
 
