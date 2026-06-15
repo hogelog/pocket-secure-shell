@@ -13,6 +13,7 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.Person
 import androidx.core.app.ServiceCompat
 import org.hogel.pocketssh.BuildConfig
 import org.hogel.pocketssh.R
@@ -959,15 +960,31 @@ class SshConnectionService : Service() {
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.notification_channel_name),
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description = getString(R.string.notification_channel_description)
-            setShowBadge(false)
-        }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = getString(R.string.notification_channel_description)
+                setShowBadge(false)
+            },
+        )
+        // Conversation mode uses a high-importance channel so the call-style
+        // notification stays prominent on the lock screen, but stays silent.
+        manager.createNotificationChannel(
+            NotificationChannel(
+                VOICE_CHANNEL_ID,
+                getString(R.string.notification_voice_channel_name),
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = getString(R.string.notification_voice_channel_description)
+                setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+            },
+        )
     }
 
     /** Notification text for the current connection state, reused when the
@@ -994,28 +1011,40 @@ class SshConnectionService : Service() {
             Intent(this, SshConnectionService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE,
         )
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_notification_terminal)
-            .setContentTitle(
-                if (voice) getString(R.string.notification_voice_title)
-                else getString(R.string.notification_title),
-            )
-            .setContentText(text)
-            .setOngoing(true)
-            .setSilent(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setContentIntent(openIntent)
         if (voice) {
+            // Render conversation mode like an ongoing phone call: a CallStyle
+            // notification whose hang-up button ends the conversation.
             val stopVoiceIntent = PendingIntent.getService(
                 this,
                 2,
                 Intent(this, SshConnectionService::class.java).setAction(ACTION_STOP_VOICE),
                 PendingIntent.FLAG_IMMUTABLE,
             )
-            builder.addAction(0, getString(R.string.notification_action_voice_stop), stopVoiceIntent)
+            val caller = Person.Builder()
+                .setName(getString(R.string.notification_voice_title))
+                .setImportant(true)
+                .build()
+            return NotificationCompat.Builder(this, VOICE_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification_terminal)
+                .setContentText(text)
+                .setOngoing(true)
+                .setSilent(true)
+                .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setContentIntent(openIntent)
+                .setStyle(NotificationCompat.CallStyle.forOngoingCall(caller, stopVoiceIntent))
+                .addAction(0, getString(R.string.notification_action_disconnect), stopIntent)
+                .build()
         }
-        builder.addAction(0, getString(R.string.notification_action_disconnect), stopIntent)
-        return builder.build()
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_terminal)
+            .setContentTitle(getString(R.string.notification_title))
+            .setContentText(text)
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(openIntent)
+            .addAction(0, getString(R.string.notification_action_disconnect), stopIntent)
+            .build()
     }
 
     private fun updateNotification(text: String) {
@@ -1131,6 +1160,7 @@ class SshConnectionService : Service() {
         const val ACTION_CANCEL_UPLOAD = "org.hogel.pocketssh.action.CANCEL_UPLOAD"
         const val ACTION_STOP_VOICE = "org.hogel.pocketssh.action.STOP_VOICE"
         private const val CHANNEL_ID = "ssh_connection"
+        private const val VOICE_CHANNEL_ID = "ssh_voice"
         private const val NOTIFICATION_ID = 1001
         private const val UPLOAD_NOTIFICATION_ID = 1002
         private const val MAX_BUFFER_BYTES = 256 * 1024
