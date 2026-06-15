@@ -1030,6 +1030,7 @@ class SshConnectionService : Service() {
                 .setOngoing(true)
                 .setSilent(true)
                 .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
                 .setContentIntent(openIntent)
                 .setStyle(NotificationCompat.CallStyle.forOngoingCall(caller, stopVoiceIntent))
                 .addAction(0, getString(R.string.notification_action_disconnect), stopIntent)
