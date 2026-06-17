@@ -2707,6 +2707,7 @@ class TerminalActivity : AppCompatActivity() {
         override fun onBell(session: TerminalSession) {}
         override fun onColorsChanged(session: TerminalSession) {}
         override fun onTerminalCursorStateChange(state: Boolean) {}
+        override fun setTerminalShellPid(session: TerminalSession, pid: Int) {}
         override fun getTerminalCursorStyle(): Int = TerminalEmulator.TERMINAL_CURSOR_STYLE_BLOCK
         override fun logError(tag: String?, message: String?) { Log.e(tag ?: TAG, message ?: "") }
         override fun logWarn(tag: String?, message: String?) { Log.w(tag ?: TAG, message ?: "") }
