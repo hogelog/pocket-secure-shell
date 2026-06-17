@@ -13,9 +13,12 @@ import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.app.Person
 import androidx.core.app.ServiceCompat
 import org.hogel.pocketssh.BuildConfig
 import org.hogel.pocketssh.R
+import org.hogel.pocketssh.tmux.TmuxControlClient
+import org.hogel.pocketssh.tmux.TmuxControlWindow
 import org.hogel.pocketssh.ui.TerminalActivity
 import java.io.ByteArrayOutputStream
 import java.util.concurrent.CopyOnWriteArrayList
@@ -40,6 +43,22 @@ class SshConnectionService : Service() {
     interface StatusListener {
         fun onSshConnected() {}
         fun onSshDisconnected(error: Throwable?) {}
+    }
+
+    /** Receives control-mode events routed per pane. Attached only while a
+     *  control-mode terminal UI is bound; raw mode keeps using
+     *  [attachOutputListener]. */
+    interface TmuxControlListener {
+        fun onPaneOutput(paneId: String, bytes: ByteArray)
+        fun onCaptureReply(paneId: String, body: ByteArray)
+        fun onWindowsChanged(windows: List<TmuxControlWindow>)
+    }
+
+    /** Lets the conversation-mode notification's "End conversation" action reach
+     *  the activity that owns the loop (recognizer + TTS), since the service only
+     *  holds the microphone foreground type, not the loop itself. */
+    interface VoiceListener {
+        fun onVoiceStopRequested()
     }
 
     inner class LocalBinder : Binder() {
@@ -80,6 +99,12 @@ class SshConnectionService : Service() {
     private var session: SshSession? = null
     private var readThread: Thread? = null
 
+    // Set when shutdown() is requested so the connect worker does not start a
+    // TOFU retry (see [runReadLoop]) after the user has already torn the
+    // connection down.
+    @Volatile
+    private var shuttingDown: Boolean = false
+
     @Volatile
     var connectionLabel: String = ""
         private set
@@ -92,6 +117,38 @@ class SshConnectionService : Service() {
     @Volatile
     var useTmux: Boolean = false
         private set
+
+    // Whether the active session runs tmux in control mode (`tmux -CC`). When
+    // set, [controlClient] parses stdout into pane output and wraps keystrokes
+    // as `send-keys`; the raw byte path is bypassed.
+    @Volatile
+    var useTmuxControlMode: Boolean = false
+        private set
+
+    @Volatile
+    private var controlClient: TmuxControlClient? = null
+    private var controlListener: TmuxControlListener? = null
+
+    @Volatile
+    private var voiceListener: VoiceListener? = null
+
+    // Whether the foreground service is currently promoted to hold the
+    // microphone (+ media playback) for conversation mode. Drives the
+    // notification's title/action and which foreground type we re-assert.
+    @Volatile
+    private var voiceForegroundActive = false
+
+    // Client size to report to tmux in control mode (a control client has no
+    // usable tty size). Sent with the first list-windows — after
+    // %session-changed, so it can't be stolen by the attach-time reply block —
+    // and again from [resizeWindow] on later changes.
+    private var clientColumns = 0
+    private var clientRows = 0
+    private var clientSizeSent = false
+
+    @Volatile private var paneOutputCount = 0
+    @Volatile private var capturesSent = 0
+    @Volatile private var captureRepliesReceived = 0
 
     // Last OSC window title observed by an attached TerminalActivity. Cached
     // here so a freshly created activity can restore its app-context
@@ -119,6 +176,17 @@ class SshConnectionService : Service() {
         Thread(r, "ssh-scp").apply { isDaemon = true }
     }
 
+    // The conversation-mode reply command gets its own executor: a reply wait
+    // can block for minutes and must not stall SCP transfers.
+    private val voiceExecutor = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "ssh-voice").apply { isDaemon = true }
+    }
+
+    // The in-flight upload, so its notification's cancel action can interrupt
+    // it without tearing down the SSH connection.
+    @Volatile
+    private var uploadFuture: Future<*>? = null
+
     private val keepaliveExecutor = Executors.newSingleThreadScheduledExecutor { r ->
         Thread(r, "ssh-keepalive").apply { isDaemon = true }
     }
@@ -135,6 +203,19 @@ class SshConnectionService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             shutdown()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_CANCEL_UPLOAD) {
+            cancelUpload()
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_STOP_VOICE) {
+            // The activity owns the loop, so ask it to exit cleanly (it will
+            // demote the foreground type via stopVoiceForeground). If it is gone,
+            // demote ourselves so the microphone type doesn't linger.
+            val listener = voiceListener
+            if (listener != null) mainHandler.post { listener.onVoiceStopRequested() }
+            else stopVoiceForeground()
             return START_NOT_STICKY
         }
         ServiceCompat.startForeground(
@@ -164,11 +245,19 @@ class SshConnectionService : Service() {
         synchronized(this) {
             if (state == State.CONNECTING || state == State.CONNECTED) return
             state = State.CONNECTING
+            shuttingDown = false
             lastError = null
             connectionLabel = "${params.username}@${params.host}:${params.port}"
             useTmux = params.useTmux
+            useTmuxControlMode = params.useTmux && params.tmuxControlMode
+            clientColumns = columns.coerceAtLeast(1)
+            clientRows = rows.coerceAtLeast(1)
+            clientSizeSent = false
+            paneOutputCount = 0
+            capturesSent = 0
+            captureRepliesReceived = 0
             lastTitle = null
-            trace { "state -> CONNECTING (useTmux=${params.useTmux})" }
+            trace { "state -> CONNECTING (useTmux=${params.useTmux} control=$useTmuxControlMode)" }
             updateNotification(getString(R.string.notification_text_connecting))
             readThread = thread(name = "ssh-read") {
                 runReadLoop(params, authenticator, hostKeyPrompt, columns, rows)
@@ -184,36 +273,71 @@ class SshConnectionService : Service() {
         rows: Int,
     ) {
         var caught: Throwable? = null
+        // Held outside the try so the finally can disconnect a connection that
+        // was opened but never published to [session] (e.g. openShell threw
+        // after connect succeeded). Without this the live Connection and its
+        // trilead receiver thread would leak on every failed retry.
+        var ssh: SshSession? = null
         try {
             val keyManager = SshKeyManager()
             val publicKey = keyManager.loadPublicKey()
                 ?: throw SshAuthenticationException("No SSH key found")
             val signatureProxy = KeystoreSignatureProxy(publicKey, keyManager, authenticator)
-            val hostKeyVerifier = TofuHostKeyVerifier(HostKeyStore(this), hostKeyPrompt)
-            val ssh = SshSession(
-                params.host,
-                params.port,
-                params.username,
-                signatureProxy,
-                hostKeyVerifier,
-            )
-            ssh.connect()
+            // Publish each attempt's session to both the worker-local [ssh]
+            // (for the finally's disconnect) and the [session] field (the
+            // line read by writeToSsh/resizeWindow/shutdown/SCP/probeLiveness)
+            // before its blocking handshake, so a shutdown() during CONNECTING
+            // can reach it (PR #232) and so input/teardown is not a no-op once
+            // connected. On a retry the old session is disconnected first, then
+            // this overwrites both with the fresh one.
+            val connected = connectWithTofuRetry(params, signatureProxy, hostKeyPrompt) {
+                ssh = it
+                session = it
+            }
             trace { "ssh connected, opening shell" }
-            ssh.openShell(
+            connected.openShell(
                 columns.coerceAtLeast(1),
                 rows.coerceAtLeast(1),
                 params.useTmux,
+                useTmuxControlMode,
             )
-            session = ssh
+            // [session] is already published by connectWithTofuRetry's onSession
+            // callback (to the final, post-retry session). The control client is
+            // bound to that same session's command channel here.
+            controlClient = if (useTmuxControlMode) {
+                TmuxControlClient(
+                    onPaneOutput = { pane, bytes ->
+                        paneOutputCount++
+                        mainHandler.post { controlListener?.onPaneOutput(pane, bytes) }
+                    },
+                    onCaptureReply = { pane, body ->
+                        captureRepliesReceived++
+                        mainHandler.post { controlListener?.onCaptureReply(pane, body) }
+                    },
+                    onWindowsChanged = { windows ->
+                        mainHandler.post { controlListener?.onWindowsChanged(windows) }
+                    },
+                    onWindowsDirty = { sendWindowList() },
+                    onExit = { reason -> trace { "tmux control %exit ${reason ?: ""}" } },
+                )
+            } else {
+                null
+            }
             state = State.CONNECTED
             lastConnectedAt = System.currentTimeMillis()
             trace { "state -> CONNECTED" }
             updateNotification(getString(R.string.notification_text_connected, connectionLabel))
-            startKeepalive(ssh)
+            startKeepalive(connected)
             notifyStatus { it.onSshConnected() }
 
             val buffer = ByteArray(8192)
-            val input = ssh.stdout
+            // Use the final, post-retry session ([connected]) for stdout, not the
+            // worker-local [ssh] which may point at a discarded first attempt.
+            val input = connected.stdout
+            val control = controlClient
+            // The window list is requested on %session-changed (see the control
+            // client), not here, so a spontaneous attach-time %begin can't steal
+            // the list-windows reply via the command FIFO.
             var lastReadTrace = 0L
             while (true) {
                 val n = input.read(buffer)
@@ -225,7 +349,13 @@ class SshConnectionService : Service() {
                     Log.d(TAG, "read total=$totalReadBytes bytes")
                     lastReadTrace = now
                 }
-                deliverOutput(buffer.copyOf(n))
+                // Control mode: the parser unescapes %output and calls
+                // deliverOutput per pane; otherwise raw bytes are the screen.
+                if (control != null) {
+                    control.feed(buffer, n)
+                } else {
+                    deliverOutput(buffer.copyOf(n))
+                }
             }
             trace { "read loop EOF (total=$totalReadBytes)" }
         } catch (e: Throwable) {
@@ -238,17 +368,79 @@ class SshConnectionService : Service() {
             // so state teardown and onSshDisconnected fire immediately —
             // otherwise the service looks alive (state CONNECTED, session
             // non-null) while every write fails with "channel is closed".
-            val dying = session
+            // Use the worker-local [ssh], not the [session] field: on an
+            // openShell failure the field is still null but the connection is
+            // already live, and only [ssh] holds it. After a successful
+            // connect the two reference the same instance.
+            val dying = ssh
             Thread({ runCatching { dying?.disconnect() } }, "ssh-shutdown-finally")
                 .apply { isDaemon = true }
                 .start()
             session = null
+            controlClient = null
             lastError = caught
             state = if (caught != null) State.FAILED else State.DISCONNECTED
             trace { "state -> $state" }
             notifyStatus { it.onSshDisconnected(caught) }
             ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
             stopSelf()
+        }
+    }
+
+    /**
+     * Connect, recovering from a TOFU host-key dialog that outlasted the
+     * kexTimeout watchdog.
+     *
+     * On a first connection the [TofuHostKeyVerifier] blocks the key exchange on
+     * the trilead receiver thread while the user confirms the host key. If they
+     * take longer than the kexTimeout the watchdog aborts the handshake with a
+     * [java.net.SocketTimeoutException] — but the verifier still persists the key
+     * the moment they accept, even on the dead handshake. So when connect() times
+     * out and the host key appeared during the attempt (it was absent before and
+     * is present now), the user did accept: retry once on a fresh session, which
+     * now finds the key trusted and completes without prompting.
+     *
+     * Any other failure — a genuinely unresponsive peer (store unchanged), a
+     * rejected key, or a shutdown requested meanwhile — propagates as before; the
+     * retry never loops.
+     *
+     * Each attempt's session is handed to [onSession] before its blocking
+     * handshake so a concurrent [shutdown] can reach and abort it, and so the
+     * read loop's finally can disconnect a connection that was opened but never
+     * reached [openShell].
+     */
+    private fun connectWithTofuRetry(
+        params: ConnectionParams,
+        signatureProxy: KeystoreSignatureProxy,
+        hostKeyPrompt: HostKeyPrompt,
+        onSession: (SshSession) -> Unit,
+    ): SshSession {
+        val hostKeyStore = HostKeyStore(this)
+        fun newSession(): SshSession =
+            SshSession(
+                params.host,
+                params.port,
+                params.username,
+                signatureProxy,
+                TofuHostKeyVerifier(hostKeyStore, hostKeyPrompt),
+            ).also(onSession)
+
+        val hadKeyBefore = hostKeyStore.get(params.host, params.port) != null
+        val first = newSession()
+        try {
+            first.connect()
+            return first
+        } catch (e: java.net.SocketTimeoutException) {
+            val keyJustTrusted = !hadKeyBefore &&
+                hostKeyStore.get(params.host, params.port) != null
+            if (!keyJustTrusted || shuttingDown) throw e
+            trace { "kex timeout but host key just trusted; retrying once" }
+            // Release the timed-out connection (and its trilead receiver thread)
+            // before opening a fresh one for the retry.
+            runCatching { first.disconnect() }
+            val retry = newSession()
+            retry.connect()
+            return retry
         }
     }
 
@@ -304,26 +496,125 @@ class SshConnectionService : Service() {
      * either.
      */
     fun attachOutputListener(listener: (ByteArray) -> Unit) {
-        val backlog: ByteArray?
+        val backlogSize: Int
+        // Hold the lock across both the listener install and the backlog
+        // posts. `mainHandler.post` is non-blocking, so the lock is held only
+        // long enough to enqueue the chunks — but that window is enough to
+        // keep any concurrent `deliverOutput` from posting newer bytes
+        // between two backlog chunks, which would replay out of order. The
+        // backlog is still split into [BACKLOG_REPLAY_CHUNK_BYTES] posts so
+        // the UI thread can interleave input events between chunks.
         synchronized(outputLock) {
-            backlog = if (outputHistory.size() > 0) outputHistory.toByteArray() else null
+            val backlog = if (outputHistory.size() > 0) outputHistory.toByteArray() else null
+            backlogSize = backlog?.size ?: 0
+            backlog?.let { full ->
+                var offset = 0
+                while (offset < full.size) {
+                    val end = minOf(offset + BACKLOG_REPLAY_CHUNK_BYTES, full.size)
+                    val chunk = full.copyOfRange(offset, end)
+                    mainHandler.post { listener(chunk) }
+                    offset = end
+                }
+            }
             outputListener = listener
         }
-        trace { "attachOutputListener backlog=${backlog?.size ?: 0}" }
-        backlog?.let { full ->
-            var offset = 0
-            while (offset < full.size) {
-                val end = minOf(offset + BACKLOG_REPLAY_CHUNK_BYTES, full.size)
-                val chunk = full.copyOfRange(offset, end)
-                mainHandler.post { listener(chunk) }
-                offset = end
-            }
-        }
+        trace { "attachOutputListener backlog=$backlogSize" }
     }
 
     fun detachOutputListener() {
         synchronized(outputLock) { outputListener = null }
         trace { "detachOutputListener" }
+    }
+
+    fun attachControlListener(listener: TmuxControlListener) {
+        controlListener = listener
+    }
+
+    fun detachControlListener() {
+        controlListener = null
+    }
+
+    /** Issue a `capture-pane` for [paneId] on the control command channel; its
+     *  reply body is routed to [TmuxControlListener.onCaptureReply]. */
+    fun requestPaneCapture(paneId: String) {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.requestCapture(paneId) ?: return
+        capturesSent++
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "capture request error", e)
+            }
+        }
+    }
+
+    /** Ask tmux for the window/pane list. tmux does not push it on attach, so
+     *  this fires on %session-changed (cold attach) and on UI re-attach. */
+    fun requestWindowList() = sendWindowList()
+
+    private val windowListRequest = Runnable { sendWindowListNow() }
+
+    /** Coalesce a burst of window notifications into a single list-windows. */
+    private fun sendWindowList() {
+        mainHandler.removeCallbacks(windowListRequest)
+        mainHandler.postDelayed(windowListRequest, WINDOW_LIST_DEBOUNCE_MS)
+    }
+
+    private fun sendWindowListNow() {
+        val out = session?.stdin ?: return
+        val control = controlClient ?: return
+        val size = if (clientSizeSent) {
+            null
+        } else {
+            clientSizeSent = true
+            control.refreshClientSize(clientColumns, clientRows)
+        }
+        val cmd = control.requestWindows()
+        sshWriteExecutor.execute {
+            try {
+                if (size != null) out.write(size)
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "list-windows request error", e)
+            }
+        }
+    }
+
+    /** Switch the active tmux window (control mode); the resulting
+     *  `%session-window-changed` re-requests the window list. */
+    fun selectWindow(windowId: String) {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.selectWindow(windowId) ?: return
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "select-window error", e)
+            }
+        }
+    }
+
+    /** Create a new tmux window (control mode; prefix keys don't work). */
+    fun newWindow() {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.newWindow() ?: return
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "new-window error", e)
+            }
+        }
+    }
+
+    /** Point keystrokes at the pane the user is viewing. */
+    fun setInputPane(paneId: String) {
+        controlClient?.setInputPane(paneId)
     }
 
     fun addStatusListener(listener: StatusListener) {
@@ -345,10 +636,17 @@ class SshConnectionService : Service() {
     }
 
     fun writeToSsh(data: ByteArray) {
+        // The session is published before the shell channel exists (during
+        // CONNECTING), so gate on CONNECTED before touching stdin.
+        if (state != State.CONNECTED) return
         val out = session?.stdin ?: return
+        // In control mode stdin is the command channel, so input must be wrapped
+        // as `send-keys` rather than written as raw bytes.
+        val bytes = controlClient?.encodeInput(data) ?: data
+        if (bytes.isEmpty()) return
         sshWriteExecutor.execute {
             try {
-                out.write(data)
+                out.write(bytes)
                 out.flush()
             } catch (e: Exception) {
                 Log.e(TAG, "SSH write error", e)
@@ -357,18 +655,172 @@ class SshConnectionService : Service() {
     }
 
     /**
-     * Upload [bytes] to the remote host as [remoteDir]/[filename] via SCP.
-     * [onResult] is invoked on the main thread with `null` on success or the
-     * thrown error on failure. Returns a [Future] the caller can `cancel(true)`
-     * to interrupt the upload thread; the SCP socket I/O unblocks with
-     * `InterruptedIOException`, so a stuck upload can be aborted without
-     * tearing down the whole SSH connection. Returns `null` if the service is
-     * not connected (in which case [onResult] is still posted asynchronously).
+     * Stream-upload to [remoteDir]/[filename] over SFTP in the background,
+     * surfacing progress, success, and failure through a dedicated
+     * notification so the terminal stays usable for the duration. The stream
+     * is opened by [openInput] on the upload thread (so opening a large source
+     * does not block the UI); [totalBytes] (<= 0 if unknown) drives the
+     * progress bar. The transfer can be cancelled from its notification action
+     * ([ACTION_CANCEL_UPLOAD]). [onResult] is posted on the main thread for the
+     * caller to run any in-app follow-up (`null` = success); UI feedback itself
+     * is the notification's job. Posts a not-connected error and returns
+     * without starting if there is no live session.
      */
-    fun uploadBytes(
-        bytes: ByteArray,
+    fun uploadFile(
+        openInput: () -> java.io.InputStream,
         filename: String,
         remoteDir: String,
+        totalBytes: Long,
+        onResult: (Throwable?) -> Unit,
+    ) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(IllegalStateException("Not connected")) }
+            return
+        }
+        showUploadProgress(filename, 0, totalBytes)
+        uploadFuture = scpExecutor.submit {
+            var lastPct = -1
+            val error = try {
+                ssh.uploadFile(openInput(), filename, remoteDir) { sent ->
+                    if (totalBytes > 0) {
+                        val pct = ((sent * 100) / totalBytes).toInt().coerceIn(0, 100)
+                        if (pct != lastPct) {
+                            lastPct = pct
+                            showUploadProgress(filename, pct, totalBytes)
+                        }
+                    }
+                }
+                null
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                cancelUploadNotification()
+                return@submit
+            } catch (e: Throwable) {
+                if (Thread.currentThread().isInterrupted) {
+                    cancelUploadNotification()
+                    return@submit
+                }
+                Log.e(TAG, "SFTP upload failed", e)
+                e
+            }
+            uploadFuture = null
+            showUploadDone(filename, error)
+            mainHandler.post { onResult(error) }
+        }
+    }
+
+    /** Cancel the in-flight upload (if any) and clear its notification. */
+    private fun cancelUpload() {
+        uploadFuture?.cancel(true)
+        uploadFuture = null
+        cancelUploadNotification()
+    }
+
+    /**
+     * Run [command] on a separate exec channel, feeding [input] to its stdin
+     * and capturing its output (used by conversation mode to wait for the
+     * reply command). Runs on [voiceExecutor]; [onResult] is posted on the main
+     * thread with the exec result or the failure.
+     */
+    fun execCommandForOutput(
+        command: String,
+        input: ByteArray,
+        timeoutMs: Long,
+        onResult: (Result<SshSession.ExecResult>) -> Unit,
+    ) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(Result.failure(IllegalStateException("Not connected"))) }
+            return
+        }
+        voiceExecutor.execute {
+            val result = runCatching { ssh.execCommandForOutput(command, input, timeoutMs) }
+            result.exceptionOrNull()?.let { Log.e(TAG, "execCommandForOutput failed", it) }
+            mainHandler.post { onResult(result) }
+        }
+    }
+
+    /** Abort the in-flight conversation-mode reply exec (if any). */
+    fun cancelVoiceExec() {
+        session?.cancelExecCommandForOutput()
+    }
+
+    fun setVoiceListener(listener: VoiceListener?) {
+        voiceListener = listener
+    }
+
+    /**
+     * Promote the foreground service to hold the microphone (and media playback
+     * for the reply TTS) so conversation mode keeps capturing speech and reading
+     * replies aloud while the app is backgrounded or the screen is off — like a
+     * call app. Must be called while the app is in the foreground (conversation
+     * mode is always entered from the visible activity), which Android requires
+     * for starting a microphone-typed foreground service. The notification
+     * switches to a "Conversation mode" title with an "End conversation" action.
+     */
+    fun startVoiceForeground() {
+        voiceForegroundActive = true
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            buildNotification(currentStatusText(), voice = true),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK,
+        )
+    }
+
+    /** Drop the microphone/media-playback foreground type when conversation mode
+     *  exits, reverting to the plain SSH-session foreground. No-op if it was
+     *  never promoted. */
+    fun stopVoiceForeground() {
+        if (!voiceForegroundActive) return
+        voiceForegroundActive = false
+        ServiceCompat.startForeground(
+            this,
+            NOTIFICATION_ID,
+            buildNotification(currentStatusText(), voice = false),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+        )
+    }
+
+    /**
+     * List remote directory [path] via SFTP for the file browser. [onResult] is
+     * invoked on the main thread with the resolved absolute path and entries on
+     * success, or the thrown error on failure. Runs on the same single-threaded
+     * [scpExecutor] as uploads/downloads, so it serializes with an in-flight
+     * transfer (acceptable: the browser is modal during a transfer).
+     */
+    fun listRemoteDir(path: String, onResult: (Result<RemoteListing>) -> Unit) {
+        val ssh = session
+        if (ssh == null || state != State.CONNECTED) {
+            mainHandler.post { onResult(Result.failure(IllegalStateException("Not connected"))) }
+            return
+        }
+        scpExecutor.submit {
+            val result = try {
+                val resolved = ssh.canonicalPath(path)
+                Result.success(RemoteListing(resolved, ssh.listDir(resolved)))
+            } catch (e: Throwable) {
+                // Do NOT log [path]: a remote path is user-controlled target data.
+                Log.e(TAG, "SFTP list failed")
+                Result.failure(e)
+            }
+            mainHandler.post { onResult(result) }
+        }
+    }
+
+    /**
+     * Download remote file [remotePath] via SFTP into [out], reporting `null` on
+     * success or the thrown error on failure on the main thread. Returns a
+     * [Future] the caller can `cancel(true)` to interrupt a stuck download. The
+     * caller owns [out] and must close it after [onResult] fires. Returns `null`
+     * if not connected (in which case [onResult] is still posted).
+     */
+    fun downloadFile(
+        remotePath: String,
+        out: java.io.OutputStream,
         onResult: (Throwable?) -> Unit,
     ): Future<*>? {
         val ssh = session
@@ -378,14 +830,14 @@ class SshConnectionService : Service() {
         }
         return scpExecutor.submit {
             val error = try {
-                ssh.uploadBytes(bytes, filename, remoteDir)
+                ssh.downloadFile(remotePath, out)
                 null
             } catch (e: InterruptedException) {
                 Thread.currentThread().interrupt()
                 return@submit
             } catch (e: Throwable) {
                 if (Thread.currentThread().isInterrupted) return@submit
-                Log.e(TAG, "SCP upload failed", e)
+                Log.e(TAG, "SFTP download failed")
                 e
             }
             mainHandler.post { onResult(error) }
@@ -393,6 +845,28 @@ class SshConnectionService : Service() {
     }
 
     fun resizeWindow(columns: Int, rows: Int) {
+        val control = controlClient
+        if (control != null) {
+            // Control mode: the SSH PTY size is meaningless to tmux; the
+            // client size travels as a refresh-client command instead.
+            clientColumns = columns.coerceAtLeast(1)
+            clientRows = rows.coerceAtLeast(1)
+            // Before the first list-windows the size rides along with it
+            // (sent only after %session-changed, when the command FIFO is
+            // safe from the attach-time reply block).
+            if (!clientSizeSent) return
+            val out = session?.stdin ?: return
+            val cmd = control.refreshClientSize(clientColumns, clientRows)
+            sshWriteExecutor.execute {
+                try {
+                    out.write(cmd)
+                    out.flush()
+                } catch (e: Exception) {
+                    Log.e(TAG, "refresh-client error", e)
+                }
+            }
+            return
+        }
         // resize sends a packet, so it must not run on the main thread.
         runCatching {
             sshWriteExecutor.execute {
@@ -432,6 +906,9 @@ class SshConnectionService : Service() {
 
     /** Tear down the SSH connection; the service will stop itself. */
     fun shutdown() {
+        // Block any in-flight TOFU retry in the connect worker (see
+        // [runReadLoop]) from reconnecting after this teardown.
+        shuttingDown = true
         // disconnect() sends an SSH-level message and must not run on the
         // main thread. Use a dedicated thread so a stuck writer can't delay
         // the teardown. The read loop will then exit and run its finally.
@@ -476,24 +953,50 @@ class SshConnectionService : Service() {
     override fun onDestroy() {
         sshWriteExecutor.shutdownNow()
         scpExecutor.shutdownNow()
+        voiceExecutor.shutdownNow()
         keepaliveExecutor.shutdownNow()
         probeExecutor.shutdownNow()
         super.onDestroy()
     }
 
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            getString(R.string.notification_channel_name),
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description = getString(R.string.notification_channel_description)
-            setShowBadge(false)
-        }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        val manager = getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(
+                CHANNEL_ID,
+                getString(R.string.notification_channel_name),
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = getString(R.string.notification_channel_description)
+                setShowBadge(false)
+            },
+        )
+        // Conversation mode uses a high-importance channel so the call-style
+        // notification stays prominent on the lock screen, but stays silent.
+        manager.createNotificationChannel(
+            NotificationChannel(
+                VOICE_CHANNEL_ID,
+                getString(R.string.notification_voice_channel_name),
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = getString(R.string.notification_voice_channel_description)
+                setShowBadge(false)
+                setSound(null, null)
+                enableVibration(false)
+            },
+        )
     }
 
-    private fun buildNotification(text: String): Notification {
+    /** Notification text for the current connection state, reused when the
+     *  voice foreground is (de)promoted without a fresh status callback. */
+    private fun currentStatusText(): String =
+        if (state == State.CONNECTED && connectionLabel.isNotEmpty()) {
+            getString(R.string.notification_text_connected, connectionLabel)
+        } else {
+            getString(R.string.notification_text_connecting)
+        }
+
+    private fun buildNotification(text: String, voice: Boolean = voiceForegroundActive): Notification {
         val openIntent = PendingIntent.getActivity(
             this,
             0,
@@ -508,6 +1011,31 @@ class SshConnectionService : Service() {
             Intent(this, SshConnectionService::class.java).setAction(ACTION_STOP),
             PendingIntent.FLAG_IMMUTABLE,
         )
+        if (voice) {
+            // Render conversation mode like an ongoing phone call: a CallStyle
+            // notification whose hang-up button ends the conversation.
+            val stopVoiceIntent = PendingIntent.getService(
+                this,
+                2,
+                Intent(this, SshConnectionService::class.java).setAction(ACTION_STOP_VOICE),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            val caller = Person.Builder()
+                .setName(getString(R.string.notification_voice_title))
+                .setImportant(true)
+                .build()
+            return NotificationCompat.Builder(this, VOICE_CHANNEL_ID)
+                .setSmallIcon(R.drawable.ic_notification_terminal)
+                .setContentText(text)
+                .setOngoing(true)
+                .setSilent(true)
+                .setCategory(NotificationCompat.CATEGORY_CALL)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setContentIntent(openIntent)
+                .setStyle(NotificationCompat.CallStyle.forOngoingCall(caller, stopVoiceIntent))
+                .addAction(0, getString(R.string.notification_action_disconnect), stopIntent)
+                .build()
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification_terminal)
             .setContentTitle(getString(R.string.notification_title))
@@ -525,6 +1053,51 @@ class SshConnectionService : Service() {
             .notify(NOTIFICATION_ID, buildNotification(text))
     }
 
+    private fun showUploadProgress(name: String, pct: Int, totalBytes: Long) {
+        val cancelIntent = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, SshConnectionService::class.java).setAction(ACTION_CANCEL_UPLOAD),
+            PendingIntent.FLAG_IMMUTABLE,
+        )
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_terminal)
+            .setContentTitle(getString(R.string.upload_notification_uploading, name))
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(0, getString(android.R.string.cancel), cancelIntent)
+        if (totalBytes > 0) {
+            builder.setContentText("$pct%").setProgress(100, pct, false)
+        } else {
+            builder.setProgress(0, 0, true)
+        }
+        getSystemService(NotificationManager::class.java)
+            .notify(UPLOAD_NOTIFICATION_ID, builder.build())
+    }
+
+    private fun showUploadDone(name: String, error: Throwable?) {
+        val text = if (error == null) {
+            getString(R.string.upload_notification_done, name)
+        } else {
+            getString(R.string.upload_notification_failed, error.message ?: "")
+        }
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification_terminal)
+            .setContentTitle(getString(R.string.notification_title))
+            .setContentText(text)
+            .setAutoCancel(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .build()
+        getSystemService(NotificationManager::class.java)
+            .notify(UPLOAD_NOTIFICATION_ID, notification)
+    }
+
+    private fun cancelUploadNotification() {
+        getSystemService(NotificationManager::class.java).cancel(UPLOAD_NOTIFICATION_ID)
+    }
+
     fun snapshot(): Snapshot {
         val bufferBytes: Int
         val attached: Boolean
@@ -537,6 +1110,7 @@ class SshConnectionService : Service() {
             lastError = lastError,
             connectionLabel = connectionLabel,
             useTmux = useTmux,
+            useTmuxControlMode = useTmuxControlMode,
             lastTitle = lastTitle,
             outputBufferBytes = bufferBytes,
             listenerAttached = attached,
@@ -545,6 +1119,9 @@ class SshConnectionService : Service() {
             lastReadAt = lastReadAt,
             totalReadBytes = totalReadBytes,
             lastKeepaliveAt = lastKeepaliveAt,
+            paneOutputCount = paneOutputCount,
+            capturesSent = capturesSent,
+            captureRepliesReceived = captureRepliesReceived,
         )
     }
 
@@ -553,6 +1130,7 @@ class SshConnectionService : Service() {
         val lastError: Throwable?,
         val connectionLabel: String,
         val useTmux: Boolean,
+        val useTmuxControlMode: Boolean,
         val lastTitle: String?,
         val outputBufferBytes: Int,
         val listenerAttached: Boolean,
@@ -561,6 +1139,9 @@ class SshConnectionService : Service() {
         val lastReadAt: Long,
         val totalReadBytes: Long,
         val lastKeepaliveAt: Long,
+        val paneOutputCount: Int,
+        val capturesSent: Int,
+        val captureRepliesReceived: Int,
     )
 
     data class ConnectionParams(
@@ -568,6 +1149,7 @@ class SshConnectionService : Service() {
         val port: Int,
         val username: String,
         val useTmux: Boolean = false,
+        val tmuxControlMode: Boolean = false,
     )
 
     private inline fun trace(message: () -> String) {
@@ -576,12 +1158,17 @@ class SshConnectionService : Service() {
 
     companion object {
         const val ACTION_STOP = "org.hogel.pocketssh.action.STOP_CONNECTION"
+        const val ACTION_CANCEL_UPLOAD = "org.hogel.pocketssh.action.CANCEL_UPLOAD"
+        const val ACTION_STOP_VOICE = "org.hogel.pocketssh.action.STOP_VOICE"
         private const val CHANNEL_ID = "ssh_connection"
+        private const val VOICE_CHANNEL_ID = "ssh_voice"
         private const val NOTIFICATION_ID = 1001
+        private const val UPLOAD_NOTIFICATION_ID = 1002
         private const val MAX_BUFFER_BYTES = 256 * 1024
         private const val BACKLOG_REPLAY_CHUNK_BYTES = 16 * 1024
         private const val KEEPALIVE_INTERVAL_SECONDS = 120L
         private const val READ_TRACE_INTERVAL_MS = 10_000L
+        private const val WINDOW_LIST_DEBOUNCE_MS = 80L
         private const val TAG = "SshConnectionService"
     }
 }

@@ -33,14 +33,32 @@ sealed class ShortcutAction {
     /** Enter the terminal's text-selection mode (the floating Copy/Paste/More toolbar). */
     object Copy : ShortcutAction()
 
-    /** Paste the system clipboard text into the SSH stdin (bracketed-paste aware). */
-    object Paste : ShortcutAction()
-
     /**
      * Open the system image picker so the user can choose an image to upload
      * to the remote host. The handler decides what to do with the picked URI.
      */
     object ImagePaste : ShortcutAction()
+
+    /**
+     * Open the remote file browser for two-way SCP/SFTP transfer: download a
+     * remote file to the device, or upload a local file into the browsed
+     * directory. The handler builds and shows the browser.
+     */
+    object Scp : ShortcutAction()
+
+    /**
+     * Toggle the terminal's secure text-input mode, which suppresses the IME's
+     * prediction and bigram learning. The handler reads and flips the current
+     * state.
+     */
+    object SecureInput : ShortcutAction()
+
+    /**
+     * Open the control-input dialog, which sends an arbitrary Ctrl-<letter>
+     * sequence (e.g. ^L, ^R) chosen from a preset grid or a one-character
+     * input field. The handler builds and shows the dialog.
+     */
+    object CtrlInput : ShortcutAction()
 }
 
 /**
@@ -61,8 +79,10 @@ sealed class ShortcutAction {
  * Recognised dynamic tokens (resolved by the caller at execution time):
  *   `{TMUX-PREFIX}` — the configured tmux prefix as a single control byte
  *   `{COPY}`        — enter the terminal's text-selection / copy mode
- *   `{PASTE}`       — paste the system clipboard text into ssh stdin
  *   `{IMAGE-PASTE}` — open the image picker so the user can upload an image
+ *   `{SCP}`         — open the remote file browser (two-way file transfer)
+ *   `{SECURE-INPUT}` — toggle the secure text-input mode (the 🔒 lock)
+ *   `{CTRL-INPUT}`  — open the control-input dialog (preset / arbitrary ^X)
  *
  * Anything else is sent verbatim as UTF-8.
  *
@@ -161,7 +181,9 @@ private fun keyTokenAction(token: String): ShortcutAction? = when (token.upperca
     )
     "TMUX-PREFIX", "TMUX_PREFIX" -> ShortcutAction.SendTmuxPrefix
     "COPY" -> ShortcutAction.Copy
-    "PASTE" -> ShortcutAction.Paste
     "IMAGE-PASTE", "IMAGE_PASTE" -> ShortcutAction.ImagePaste
+    "SCP" -> ShortcutAction.Scp
+    "SECURE-INPUT", "SECURE_INPUT" -> ShortcutAction.SecureInput
+    "CTRL-INPUT", "CTRL_INPUT" -> ShortcutAction.CtrlInput
     else -> null
 }

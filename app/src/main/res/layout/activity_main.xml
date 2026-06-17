@@ -303,6 +303,15 @@
                 </LinearLayout>
             </LinearLayout>
 
+            <com.google.android.material.materialswitch.MaterialSwitch
+                android:id="@+id/switch_control_mode"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:minHeight="48dp"
+                android:text="@string/tmux_control_mode"
+                android:visibility="gone" />
+
             <LinearLayout
                 android:id="@+id/header_shortcuts"
                 android:layout_width="match_parent"

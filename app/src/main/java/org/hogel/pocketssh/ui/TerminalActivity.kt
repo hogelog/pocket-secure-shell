@@ -5,22 +5,36 @@ import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.DialogInterface
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.MediaStore
+import android.provider.OpenableColumns
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.SystemClock
+import android.text.InputFilter
+import android.text.InputType
 import android.util.Log
 import android.util.TypedValue
 import android.view.GestureDetector
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
 import android.view.KeyCharacterMap
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -28,10 +42,14 @@ import android.view.View
 import android.view.WindowManager
 import android.view.inputmethod.InputMethodManager
 import android.widget.Button
+import android.widget.EditText
+import android.widget.ArrayAdapter
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
+import android.widget.ListView
 import android.widget.ProgressBar
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -40,6 +58,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.core.content.edit
+import java.io.File
+import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -47,6 +67,7 @@ import java.util.TimeZone
 import java.util.concurrent.Executors
 import java.util.concurrent.SynchronousQueue
 import java.util.concurrent.atomic.AtomicBoolean
+import org.hogel.pocketssh.MainActivity
 import org.hogel.pocketssh.R
 import org.hogel.pocketssh.databinding.ActivityTerminalBinding
 import org.hogel.pocketssh.learning.BigramStore
@@ -61,8 +82,11 @@ import org.hogel.pocketssh.shortcuts.resolve
 import org.hogel.pocketssh.ssh.BiometricAuthenticationException
 import org.hogel.pocketssh.ssh.BiometricAuthenticator
 import org.hogel.pocketssh.ssh.HostKeyPrompt
+import org.hogel.pocketssh.ssh.RemoteListing
 import org.hogel.pocketssh.ssh.SshConnectionService
 import org.hogel.pocketssh.ssh.SshKeyManager
+import org.hogel.pocketssh.ssh.SshSession
+import org.hogel.pocketssh.tmux.TmuxControlWindow
 import org.hogel.pocketssh.tmux.TmuxTitle
 import org.hogel.pocketssh.tmux.TmuxWindow
 import com.termux.terminal.KeyHandler
@@ -70,6 +94,9 @@ import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalViewClient
+import com.termux.view.abortFling
+import com.termux.view.flingScrollback
+import com.termux.view.scrollToBottom
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -136,6 +163,16 @@ class TerminalActivity : AppCompatActivity() {
             }
 
             runOnUiThread {
+                // If the activity was destroyed while CONNECTING (back-press, or
+                // a uiMode change the manifest does not handle), showing the
+                // prompt would crash and, worse, never unblock the ssh-read
+                // thread parked on take() below. Reject immediately instead.
+                if (isFinishing || isDestroyed) {
+                    resultQueue.put(Result.failure(
+                        BiometricAuthenticationException("Activity destroyed before biometric prompt"),
+                    ))
+                    return@runOnUiThread
+                }
                 val prompt = BiometricPrompt(
                     this@TerminalActivity,
                     biometricExecutor,
@@ -149,7 +186,15 @@ class TerminalActivity : AppCompatActivity() {
                         androidx.biometric.BiometricManager.Authenticators.BIOMETRIC_STRONG,
                     )
                     .build()
-                prompt.authenticate(info)
+                try {
+                    prompt.authenticate(info)
+                } catch (e: Exception) {
+                    // e.g. IllegalStateException from a fragment commit onto a
+                    // torn-down FragmentActivity. Unblock the ssh-read thread.
+                    resultQueue.put(Result.failure(
+                        BiometricAuthenticationException("Failed to show biometric prompt", e),
+                    ))
+                }
             }
 
             resultQueue.take().getOrThrow()
@@ -168,25 +213,51 @@ class TerminalActivity : AppCompatActivity() {
             // is false so a stray back-press cannot silently accept the key.
             val resultQueue = SynchronousQueue<Boolean>()
             runOnUiThread {
-                AlertDialog.Builder(this@TerminalActivity)
-                    .setTitle(R.string.host_key_verify_title)
-                    .setMessage(
-                        getString(
-                            R.string.host_key_verify_message,
-                            host,
-                            port,
-                            algorithm,
-                            fingerprint,
-                        ),
-                    )
-                    .setCancelable(false)
-                    .setPositiveButton(R.string.host_key_accept) { _, _ ->
-                        resultQueue.put(true)
-                    }
-                    .setNegativeButton(android.R.string.cancel) { _, _ ->
-                        resultQueue.put(false)
-                    }
-                    .show()
+                // If the activity was destroyed while CONNECTING (back-press, or
+                // a uiMode change the manifest does not handle), showing the
+                // dialog would throw BadTokenException and never unblock the
+                // ssh-read thread parked on take() below. Reject the key instead.
+                if (isFinishing || isDestroyed) {
+                    resultQueue.put(false)
+                    return@runOnUiThread
+                }
+                try {
+                    val dialog = AlertDialog.Builder(this@TerminalActivity)
+                        .setTitle(R.string.host_key_verify_title)
+                        .setMessage(
+                            getString(
+                                R.string.host_key_verify_message,
+                                host,
+                                port,
+                                algorithm,
+                                fingerprint,
+                            ),
+                        )
+                        .setCancelable(false)
+                        .setPositiveButton(R.string.host_key_accept) { _, _ ->
+                            // Clear the fields first so a destroy racing this
+                            // listener cannot offer a stale result onto a queue
+                            // the receiver has already left.
+                            hostKeyDialog = null
+                            hostKeyResultQueue = null
+                            resultQueue.put(true)
+                        }
+                        .setNegativeButton(android.R.string.cancel) { _, _ ->
+                            hostKeyDialog = null
+                            hostKeyResultQueue = null
+                            resultQueue.put(false)
+                        }
+                        .show()
+                    // Hold the dialog and queue so onDestroy can reject the key
+                    // and unblock the receiver thread if the activity is torn
+                    // down while the dialog is still showing.
+                    hostKeyDialog = dialog
+                    hostKeyResultQueue = resultQueue
+                } catch (e: Exception) {
+                    // e.g. BadTokenException showing onto a torn-down window.
+                    // Unblock the ssh-read thread by rejecting the key.
+                    resultQueue.put(false)
+                }
             }
             return resultQueue.take()
         }
@@ -222,10 +293,24 @@ class TerminalActivity : AppCompatActivity() {
     // buffer from growing without bound across the session.
     private val recentOutputTail = java.io.ByteArrayOutputStream()
 
-    // Active image-upload progress dialog, or null when no upload is in
-    // flight. Held so onDestroy can dismiss it to avoid a window leak when
-    // the activity tears down mid-upload.
-    private var uploadDialog: AlertDialog? = null
+
+    // Active SCP file-browser and transfer-progress dialogs, plus the directory
+    // a pending upload targets. Held so onDestroy can dismiss any open window
+    // and the document picker callback knows where to put the file.
+    private var scpBrowserDialog: AlertDialog? = null
+    private var scpTransferDialog: AlertDialog? = null
+
+    // Active host-key confirmation dialog and the queue its ssh-read thread is
+    // parked on. Held so onDestroy can reject the pending key and unblock that
+    // thread: a uiMode change (dark-mode auto-switch, split-screen) destroys the
+    // activity while the dialog is showing, which force-closes the window
+    // without firing any button or dismiss listener, so nobody would otherwise
+    // hand a result back to the receiver thread.
+    private var hostKeyDialog: AlertDialog? = null
+    private var hostKeyResultQueue: SynchronousQueue<Boolean>? = null
+    private var scpUploadTargetDir: String? = null
+    private var scpBrowserListView: ListView? = null
+    private var scpBrowserPathHeader: TextView? = null
 
     private var fontSizePx = DEFAULT_FONT_SIZE_PX
     private val terminalPrefs by lazy { getSharedPreferences(PREFS_TERMINAL, Context.MODE_PRIVATE) }
@@ -285,6 +370,10 @@ class TerminalActivity : AppCompatActivity() {
     // its own `doScroll` doesn't emit a duplicate mouse/arrow sequence to the
     // dummy pty (which the kernel then echoes back into the screen buffer).
     private var handlingScrollGesture = false
+    // Set when our onFling started a row-unit scrollback fling; the UP is
+    // then consumed (and replayed as CANCEL) so TerminalView's own
+    // pixel-velocity fling never also fires.
+    private var nativeFlingClaimed = false
     // Set by the detector's onSingleTapUp when the gesture resolved as a tap
     // (not a scroll / long-press). Consulted at ACTION_UP to decide whether to
     // swallow the up-event and run our own keyboard toggle.
@@ -321,7 +410,105 @@ class TerminalActivity : AppCompatActivity() {
         ActivityResultContracts.PickVisualMedia(),
     ) { uri -> if (uri != null) onImagePicked(uri) }
 
+    // Voice input (push-to-talk): permission is requested on the first press;
+    // that press only grants — the user holds again to actually record.
+    private val recordAudioPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (!granted) {
+            Toast.makeText(this, R.string.voice_permission_denied, Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /**
+     * Conversation mode: a hands-free loop of listen (on-device STT) →
+     * auto-send → wait for the reply command → speak its stdout via the device
+     * TTS → listen again. The mic button toggles it.
+     */
+    private enum class VoiceConversation { OFF, LISTENING, WAITING_REPLY, SPEAKING }
+
+    private var voiceConversation = VoiceConversation.OFF
+    private var voiceTts: TextToSpeech? = null
+    private var voiceTtsReady = false
+    // On-device speech-to-text drives the listen half of the loop: the
+    // recognizer reports its own end-of-speech, so there is no separate VAD or
+    // remote transcription step. It must be created and used on the main thread.
+    private var speechRecognizer: SpeechRecognizer? = null
+    private val voiceHandler = Handler(Looper.getMainLooper())
+    // Short earcons so the loop's state is audible hands-free: one cue when it
+    // is the user's turn to speak, another when an utterance was sent and a
+    // reply is pending. SPEAKING needs no cue — the TTS itself is the audio.
+    private var voiceTone: ToneGenerator? = null
+
+    private val recognitionListener = object : RecognitionListener {
+        override fun onReadyForSpeech(params: Bundle?) {}
+
+        override fun onBeginningOfSpeech() {
+            if (voiceConversation == VoiceConversation.LISTENING) {
+                binding.swipeFeedback.text = getString(R.string.voice_recording)
+            }
+        }
+
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+
+        override fun onError(error: Int) = onRecognizerError(error)
+
+        override fun onResults(results: Bundle?) {
+            val text = results
+                ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+                .orEmpty()
+            onRecognizedText(text)
+        }
+
+        override fun onPartialResults(partialResults: Bundle?) {}
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
+    // SAF file picker for SCP upload. The chosen file is uploaded into
+    // [scpUploadTargetDir], the directory the browser was showing when the
+    // user tapped "Upload here".
+    private val scpUploadPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri -> if (uri != null) onScpUploadFilePicked(uri) }
+
     private val outputListener: (ByteArray) -> Unit = ::handleSshOutput
+
+    private var paneManager: PaneManager? = null
+
+    private val controlListener = object : SshConnectionService.TmuxControlListener {
+        override fun onPaneOutput(paneId: String, bytes: ByteArray) {
+            paneManager?.onOutput(paneId, bytes)
+            // Only the viewed pane drives secure-input detection. recentOutputTail
+            // is a single shared buffer, so scanning background panes would both
+            // misfire on their `password:` lines and interleave bytes from
+            // concurrent panes into a meaningless tail.
+            if (paneId == paneManager?.activePaneId) detectPasswordPrompt(bytes)
+        }
+
+        override fun onCaptureReply(paneId: String, body: ByteArray) {
+            paneManager?.onCaptureReply(paneId, body)
+        }
+
+        override fun onWindowsChanged(windows: List<TmuxControlWindow>) {
+            paneManager?.setWindows(windows)
+            applyControlWindows(windows)
+            // Drive the per-app shortcut bar from the active window's foreground
+            // command (control mode has no OSC title to carry it).
+            val command = windows.firstOrNull { it.active }?.command
+            if (!command.isNullOrEmpty() && command != lastAppContext) applyContext(command)
+        }
+    }
+
+    // The conversation-mode notification's "End conversation" action routes here
+    // (the service holds the mic foreground type but the activity owns the loop).
+    private val voiceListener = object : SshConnectionService.VoiceListener {
+        override fun onVoiceStopRequested() {
+            runOnUiThread { exitVoiceConversation() }
+        }
+    }
 
     private fun handleSshOutput(data: ByteArray) {
         val emulator = binding.terminalView.mEmulator ?: return
@@ -404,8 +591,8 @@ class TerminalActivity : AppCompatActivity() {
             val svc = (ibinder as SshConnectionService.LocalBinder).getService()
             service = svc
             bound = true
-            svc.attachOutputListener(outputListener)
             svc.addStatusListener(statusListener)
+            svc.setVoiceListener(voiceListener)
             val params = pendingParams
             when {
                 svc.state == SshConnectionService.State.IDLE && params != null -> {
@@ -428,6 +615,25 @@ class TerminalActivity : AppCompatActivity() {
             // per-app shortcut row survives even when the title OSC has rolled
             // out of the buffer.
             useTmux = svc.useTmux
+            if (svc.useTmuxControlMode) {
+                paneManager = PaneManager(
+                    binding.terminalView,
+                    sessionClient,
+                    { svc.requestPaneCapture(it) },
+                    { paneId ->
+                        svc.setInputPane(paneId)
+                        // Switching panes: drop the old pane's tail so a
+                        // password-prompt match can't span the two panes' bytes.
+                        recentOutputTail.reset()
+                    },
+                )
+                svc.attachControlListener(controlListener)
+                // Cold attach gets the window list via %session-changed; a
+                // re-attach to an already-connected service must ask again.
+                if (svc.state == SshConnectionService.State.CONNECTED) svc.requestWindowList()
+            } else {
+                svc.attachOutputListener(outputListener)
+            }
             applyTitle(svc.lastTitle)
             // Already-connected branch: a deeplink fired while the SSH session
             // was alive needs to switch windows now (no onSshConnected callback
@@ -461,6 +667,7 @@ class TerminalActivity : AppCompatActivity() {
             pendingParams = SshConnectionService.ConnectionParams(
                 host, port, username,
                 intent.getBooleanExtra(EXTRA_USE_TMUX, false),
+                intent.getBooleanExtra(EXTRA_TMUX_CONTROL_MODE, false),
             )
         }
         pendingTmuxWindow = intent.getStringExtra(EXTRA_TMUX_WINDOW)
@@ -475,6 +682,11 @@ class TerminalActivity : AppCompatActivity() {
         binding.windowTabsNew.setOnClickListener { openNewTmuxWindow() }
         binding.fabMain.setOnClickListener { setFabExpanded(!fabExpanded) }
         setFabExpanded(false)
+        binding.btnKeyboard.setOnClickListener {
+            binding.imeProxy.requestFocus()
+            toggleSoftKeyboard()
+        }
+        setupVoiceButton()
         binding.btnPasswordBadge.setOnClickListener { setSecureInput(false) }
         // Initial sync so the IME proxy / badge visibility match the
         // default-off state on a freshly created activity.
@@ -501,6 +713,8 @@ class TerminalActivity : AppCompatActivity() {
         // the cascade on every resume so edits take effect the moment we come
         // back, without waiting for tmux to re-emit the title OSC.
         applyContext(lastAppContext)
+        // Same for the voice commands, which are edited on the main screen.
+        updateVoiceButtonVisibility()
         maybeProbeLiveness()
     }
 
@@ -654,6 +868,48 @@ class TerminalActivity : AppCompatActivity() {
         }
     }
 
+    private var lastControlWindows: List<TmuxControlWindow> = emptyList()
+
+    /** Control-mode tab strip: same look as [applyWindowList] but driven by the
+     *  control-channel window list, with tabs that select by window id. */
+    private fun applyControlWindows(windows: List<TmuxControlWindow>) {
+        if (windows == lastControlWindows) return
+        lastControlWindows = windows
+        val container = binding.windowTabs
+        container.removeAllViews()
+        // Control mode appends its own dynamic "+" tab (wired to newWindow())
+        // below. The static layout "+" must stay hidden here — its tap goes
+        // through openNewTmuxWindow()/writeToSsh, which control mode wraps as
+        // send-keys into the active pane instead of creating a window.
+        binding.windowTabsNew.visibility = View.GONE
+        binding.windowTabsBar.visibility = if (windows.isNotEmpty()) View.VISIBLE else View.GONE
+        if (windows.isEmpty()) return
+        val tabHorizontalPaddingPx = dpToPx(6)
+        val tabMinDimensionPx = dpToPx(32)
+        for (window in windows) {
+            val label = getString(R.string.window_tab_label, window.index, window.name)
+            val tab = makeAuxButton(label) { service?.selectWindow(window.id) }
+            tab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            tab.setPadding(tabHorizontalPaddingPx, 0, tabHorizontalPaddingPx, 0)
+            tab.minWidth = tabMinDimensionPx
+            tab.minimumWidth = tabMinDimensionPx
+            tab.minHeight = tabMinDimensionPx
+            tab.minimumHeight = tabMinDimensionPx
+            styleModifierButton(tab)
+            tab.isActivated = window.active
+            container.addView(tab, auxButtonLayoutParams())
+        }
+        val newTab = makeAuxButton("+") { service?.newWindow() }
+        newTab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        newTab.setPadding(tabHorizontalPaddingPx, 0, tabHorizontalPaddingPx, 0)
+        newTab.minWidth = tabMinDimensionPx
+        newTab.minimumWidth = tabMinDimensionPx
+        newTab.minHeight = tabMinDimensionPx
+        newTab.minimumHeight = tabMinDimensionPx
+        styleModifierButton(newTab)
+        container.addView(newTab, auxButtonLayoutParams())
+    }
+
     /**
      * Send the tmux key sequence that selects window [index]. Indices 0..9
      * map to `prefix + digit`; higher indices go through `prefix : select-
@@ -680,7 +936,7 @@ class TerminalActivity : AppCompatActivity() {
      * Rebuild the shortcut bar. The bottom row flattens every matching
      * [ContextGroup] into a single horizontally-scrolling line, ordered
      * specifity high → low so the active foreground command's deck sits
-     * left of the always-on `/`–`^D` slice. The learned-suggestions row
+     * left of the always-on slice. The learned-suggestions row
      * stays above it when bigram counts yield candidates for the active
      * `(context, prev)`. Ctrl is the left-most button on the bottom row as
      * a sticky modifier toggle; it can't be expressed inside a
@@ -733,6 +989,7 @@ class TerminalActivity : AppCompatActivity() {
             runShortcutAction("\\r")
         } else {
             {
+                scrollToBottom(binding.terminalView)
                 service?.writeToSsh("$token ".toByteArray(Charsets.UTF_8))
                 bigramTracker.commitToken(token)
             }
@@ -790,51 +1047,60 @@ class TerminalActivity : AppCompatActivity() {
 
     /**
      * Rebuild the FAB speed-dial menu. Each [ContextGroup] that contributed a
-     * non-empty `fabItems` list becomes one horizontal row; rows are stacked
-     * specifity high → low (closest match at the top, "always" at the bottom).
-     *
-     * The bottom row (the "always" group) is augmented with a system-level
-     * secure-input toggle button at its left edge, so the toggle is always
-     * reachable from any context without needing a dedicated row. When the
-     * always group has no FAB items the toggle becomes the row's only entry.
+     * non-empty `fabItems` list becomes one or more horizontal rows, wrapping
+     * at [FAB_MAX_COLUMNS] buttons; rows are stacked specifity high → low
+     * (closest match at the top, "always" at the bottom). The secure-input
+     * toggle is an ordinary `{SECURE-INPUT}` item in the bundled defaults, so
+     * everything here is just the resolved shortcuts.
      */
+    @SuppressLint("ClickableViewAccessibility")
     private fun rebuildFab(rows: List<List<Shortcut>>) {
         val container = binding.fabActions
         container.removeAllViews()
 
-        // Ensure there is always at least one row so the system toggle has
-        // somewhere to live.
-        val effectiveRows = if (rows.isEmpty()) listOf(emptyList()) else rows
-        val lastIndex = effectiveRows.size - 1
-        for ((index, row) in effectiveRows.withIndex()) {
-            val rowView = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT,
-                ).apply { gravity = android.view.Gravity.END }
-                gravity = android.view.Gravity.END
-            }
-            if (index == lastIndex) {
-                val systemBtn = makeAuxButton(getString(R.string.password_mode_label)) {
-                    setSecureInput(!secureInputActive)
-                    setFabExpanded(false)
+        for (row in rows) {
+            // Wrap a wide group into stacked rows of at most FAB_MAX_COLUMNS so
+            // the buttons stay thumb-reachable instead of running off-screen.
+            for (chunk in row.chunked(FAB_MAX_COLUMNS)) {
+                val rowView = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    layoutParams = LinearLayout.LayoutParams(
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                        LinearLayout.LayoutParams.WRAP_CONTENT,
+                    ).apply { gravity = android.view.Gravity.END }
+                    gravity = android.view.Gravity.END
                 }
-                systemBtn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
-                rowView.addView(systemBtn)
-            }
-            for (shortcut in row) {
-                val btn = makeAuxButton(shortcut.label) {
-                    runShortcutActions(parseShortcutActions(shortcut.payload))
-                    setFabExpanded(false)
+                for (shortcut in chunk) {
+                    val btn = makeAuxButton(shortcut.label) {
+                        runShortcutActions(parseShortcutActions(shortcut.payload))
+                        setFabExpanded(false)
+                    }
+                    // Override the bar-button background with the FAB variant —
+                    // same fill but with a 1dp stroke, so adjacent buttons render
+                    // thin inter-cell borders without a divider mechanism.
+                    btn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
+                    // Reveal the payload in the center overlay while pressed so the
+                    // emoji label stays decipherable, hiding it as soon as the touch
+                    // slides off the button (which also cancels the click). Returning
+                    // false keeps the click handler firing on release, so a press can
+                    // be a peek-only confirmation.
+                    btn.setOnTouchListener { v, event ->
+                        when (event.actionMasked) {
+                            MotionEvent.ACTION_DOWN -> showPayloadFeedback(shortcut)
+                            MotionEvent.ACTION_MOVE ->
+                                if (event.x in 0f..v.width.toFloat() && event.y in 0f..v.height.toFloat()) {
+                                    showPayloadFeedback(shortcut)
+                                } else {
+                                    hideSwipeFeedback()
+                                }
+                            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> hideSwipeFeedback()
+                        }
+                        false
+                    }
+                    rowView.addView(btn)
                 }
-                // Override the bar-button background with the FAB variant —
-                // same fill but with a 1dp stroke, so adjacent buttons render
-                // thin inter-cell borders without a divider mechanism.
-                btn.background = ContextCompat.getDrawable(this, R.drawable.bg_fab_button)
-                rowView.addView(btn)
+                container.addView(rowView)
             }
-            container.addView(rowView)
         }
     }
 
@@ -850,8 +1116,10 @@ class TerminalActivity : AppCompatActivity() {
             is ShortcutAction.SendKey -> sendKeyCode(action.keyCode, action.keyMod)
             is ShortcutAction.SendTmuxPrefix -> writeToSsh(byteArrayOf(readTmuxPrefixByte()))
             is ShortcutAction.Copy -> startTextSelection()
-            is ShortcutAction.Paste -> pasteClipboardToSsh()
             is ShortcutAction.ImagePaste -> launchImagePicker()
+            is ShortcutAction.Scp -> launchScpBrowser()
+            is ShortcutAction.SecureInput -> setSecureInput(!secureInputActive)
+            is ShortcutAction.CtrlInput -> showControlInputDialog()
         }
         clearStickyModifiers()
     }
@@ -869,6 +1137,69 @@ class TerminalActivity : AppCompatActivity() {
             .start()
     }
 
+    /**
+     * Show the control-input dialog: a grid of common Ctrl sequences plus a
+     * one-character field for any other letter. Every entry is sent by feeding
+     * a `^X` payload back through [parseShortcutActions], so the C0 mapping
+     * stays in one place ([ctrlByteFor]).
+     */
+    private fun showControlInputDialog() {
+        val pad = dpToPx(16)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+
+        var dialog: AlertDialog? = null
+        fun send(payload: String) {
+            runShortcutActions(parseShortcutActions(payload))
+            dialog?.dismiss()
+        }
+
+        CTRL_INPUT_PRESETS.chunked(CTRL_INPUT_COLUMNS).forEach { chunk ->
+            val rowView = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            for (preset in chunk) {
+                val btn = makeAuxButton(preset) { send(preset) }
+                btn.layoutParams = auxButtonLayoutParams()
+                rowView.addView(btn)
+            }
+            root.addView(rowView)
+        }
+
+        val edit = EditText(this).apply {
+            hint = getString(R.string.ctrl_input_hint)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            filters = arrayOf(InputFilter.LengthFilter(1))
+            minWidth = dpToPx(64)
+        }
+        fun sendTyped(): Boolean {
+            val ch = edit.text.toString().firstOrNull() ?: return false
+            send("^$ch")
+            return true
+        }
+        edit.setOnEditorActionListener { _, _, _ -> sendTyped() }
+
+        val inputRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dpToPx(2), dpToPx(12), dpToPx(2), 0)
+            addView(TextView(this@TerminalActivity).apply { text = getString(R.string.ctrl_input_prefix) })
+            addView(edit, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(
+                makeAuxButton(getString(R.string.ctrl_input_send)) { sendTyped() }
+                    .apply { layoutParams = auxButtonLayoutParams() },
+            )
+        }
+        root.addView(inputRow)
+
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.ctrl_input_title)
+            .setView(root)
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        dialog.show()
+    }
+
     private fun launchImagePicker() {
         imagePickerLauncher.launch(
             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
@@ -876,14 +1207,13 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Upload the picked image to the remote host via SCP and, on success,
+     * Upload the picked image to the remote host via SFTP and, on success,
      * type its `/tmp/...` path into the SSH stdin so the user can submit
      * it to Claude Code by pressing Enter.
      *
-     * A non-cancelable progress dialog blocks the UI for the duration so a
-     * second pick can't kick off a concurrent upload; the Cancel button
-     * interrupts the SCP worker so a hung network upload can be abandoned
-     * without disconnecting the whole SSH session.
+     * The transfer runs in the background (progress/result surface through the
+     * service notification) so the terminal stays usable; the path is typed
+     * on success only if this activity is still around to receive the result.
      */
     private fun onImagePicked(uri: Uri) {
         val svc = service
@@ -898,18 +1228,640 @@ class TerminalActivity : AppCompatActivity() {
             timeZone = TimeZone.getTimeZone("Asia/Tokyo")
         }.format(Date())
         val filename = "pocketssh-$timestamp.$ext"
-        val bytes = try {
-            resolver.openInputStream(uri)?.use { it.readBytes() }
+
+        svc.uploadFile(
+            { resolver.openInputStream(uri) ?: throw IOException("Cannot open picked image") },
+            filename,
+            REMOTE_TMP_DIR,
+            queryFileSize(uri),
+        ) { error ->
+            if (error == null) {
+                val pathRef = "$REMOTE_TMP_DIR/$filename "
+                writeToSsh(pathRef.toByteArray(Charsets.UTF_8))
+            }
+        }
+    }
+
+    /**
+     * Conversation mode. Speech is recognized on-device; each recognized
+     * utterance is sent as typed input, then the user-configured reply
+     * command's stdout is read aloud with the device TTS. pss knows nothing
+     * about the conversation itself — vocabulary and any post-processing live
+     * entirely in that remote command. One-shot dictation is deliberately not
+     * offered: the IME's voice typing already covers it.
+     */
+    private fun setupVoiceButton() {
+        binding.btnVoice.setOnClickListener {
+            if (voiceConversation == VoiceConversation.OFF) {
+                enterVoiceConversation()
+            } else {
+                exitVoiceConversation()
+            }
+        }
+        updateVoiceButtonVisibility()
+    }
+
+    private fun updateVoiceButtonVisibility() {
+        // Conversation mode needs on-device speech recognition; the reply helper
+        // is installed on demand, so the button only depends on STT being there.
+        binding.btnVoice.visibility =
+            if (SpeechRecognizer.isRecognitionAvailable(this)) View.VISIBLE else View.GONE
+    }
+
+    private fun enterVoiceConversation() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            return
+        }
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.voice_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        // The reply command is pss's own bundled helper, installed on the server
+        // on first use and re-pushed after an app update bumps its version.
+        val installed = terminalPrefs.getInt(KEY_VOICE_HELPER_VERSION, 0)
+        when {
+            installed >= VOICE_HELPER_VERSION -> startVoiceConversation()
+            installed == 0 -> AlertDialog.Builder(this)
+                .setTitle(R.string.voice_helper_install_title)
+                .setMessage(R.string.voice_helper_install_message)
+                .setPositiveButton(android.R.string.ok) { _, _ -> installVoiceHelper(svc) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
+            // Already consented once; a version bump re-pushes silently.
+            else -> installVoiceHelper(svc)
+        }
+    }
+
+    private fun startVoiceConversation() {
+        initVoiceTts()
+        // Promote the SSH foreground service to hold the microphone (and media
+        // playback for the reply TTS) so the loop keeps running when the app is
+        // backgrounded or the screen is off — like a call app. Entered from the
+        // visible activity, which Android requires for a mic-typed FGS start.
+        service?.startVoiceForeground()
+        binding.btnVoice.setColorFilter(VOICE_MODE_ACTIVE_COLOR)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Move off OFF before the first turn: startListeningTurn() guards on OFF
+        // to suppress cues fired after a mid-flight exit, which would otherwise
+        // swallow this very entry.
+        voiceConversation = VoiceConversation.LISTENING
+        startListeningTurn()
+    }
+
+    /** Push the bundled reply helper to the server over the same exec primitive
+     *  the reply wait uses, then start the loop. Records the installed version so
+     *  later entries skip the round trip until an app update bumps it. */
+    private fun installVoiceHelper(svc: SshConnectionService) {
+        val script = resources.openRawResource(R.raw.voice_reply_wait).use { it.readBytes() }
+        Toast.makeText(this, R.string.voice_helper_installing, Toast.LENGTH_SHORT).show()
+        svc.execCommandForOutput(
+            VOICE_HELPER_INSTALL_CMD, script, VOICE_HELPER_INSTALL_TIMEOUT_MS,
+        ) { result ->
+            if (result.getOrNull()?.exitStatus == 0) {
+                terminalPrefs.edit { putInt(KEY_VOICE_HELPER_VERSION, VOICE_HELPER_VERSION) }
+                startVoiceConversation()
+            } else {
+                Toast.makeText(this, R.string.voice_helper_install_failed, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun exitVoiceConversation() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        voiceConversation = VoiceConversation.OFF
+        voiceHandler.removeCallbacksAndMessages(null)
+        speechRecognizer?.let { recognizer ->
+            runCatching { recognizer.cancel() }
+            runCatching { recognizer.destroy() }
+        }
+        speechRecognizer = null
+        voiceTone?.release()
+        voiceTone = null
+        // Abort an in-flight reply exec: a stranded reply waiter would hog the
+        // voice executor and steal the next conversation's reply.
+        service?.cancelVoiceExec()
+        // Drop the microphone/media-playback foreground type now that the loop
+        // is stopping; the SSH session keeps its own foreground.
+        service?.stopVoiceForeground()
+        voiceTts?.stop()
+        binding.swipeFeedback.visibility = View.GONE
+        binding.btnVoice.clearColorFilter()
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    private fun initVoiceTts() {
+        if (voiceTts != null) return
+        // Engine and language follow the device TTS settings; replies are
+        // whatever the remote reply command prints.
+        val tts = TextToSpeech(this) { status ->
+            voiceTtsReady = status == TextToSpeech.SUCCESS
+        }
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) {}
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread { resumeListeningAfterSpeech() }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {
+                runOnUiThread { resumeListeningAfterSpeech() }
+            }
+        })
+        voiceTts = tts
+    }
+
+    private fun resumeListeningAfterSpeech() {
+        if (voiceConversation != VoiceConversation.SPEAKING) return
+        startListeningTurn()
+    }
+
+    /** Begin a fresh user turn: signal "your turn" (earcon + haptic) once, then
+     *  arm the recognizer. The cue fires only here, not on the silent re-arms a
+     *  no-speech timeout triggers, so idle waiting reads as one continuous
+     *  listen rather than a stutter of give-up/restart cycles. */
+    private fun startListeningTurn() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        playVoiceTone(TONE_LISTENING)
+        binding.btnVoice.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        armListening()
+    }
+
+    /** (Re)arm an on-device recognition pass without any cue. The recognizer
+     *  reports its own end-of-speech, so [onRecognizedText] advances the loop;
+     *  Google's engine also times out after a few seconds of pre-speech silence,
+     *  which surfaces as a benign error we just re-arm from. */
+    private fun armListening() {
+        if (voiceConversation == VoiceConversation.OFF) return
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            exitVoiceConversation()
+            return
+        }
+        val recognizer = ensureSpeechRecognizer()
+        if (recognizer == null) {
+            Toast.makeText(this, R.string.voice_stt_unavailable, Toast.LENGTH_LONG).show()
+            exitVoiceConversation()
+            return
+        }
+        voiceConversation = VoiceConversation.LISTENING
+        binding.swipeFeedback.text = getString(R.string.voice_mode_listening)
+        binding.swipeFeedback.visibility = View.VISIBLE
+        // A fresh pass must always start from idle: cancel() clears any session
+        // a previous error left half-open, otherwise startListening throws BUSY.
+        runCatching { recognizer.cancel() }
+        try {
+            recognizer.startListening(buildRecognizerIntent())
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to read picked image", e)
+            Log.e(TAG, "startListening failed", e)
+            restartListeningSoon(RECOGNIZER_RESTART_MS)
+        }
+    }
+
+    private fun playVoiceTone(toneType: Int) {
+        val tone = voiceTone ?: runCatching {
+            ToneGenerator(AudioManager.STREAM_MUSIC, VOICE_TONE_VOLUME)
+        }.getOrNull()?.also { voiceTone = it } ?: return
+        runCatching { tone.startTone(toneType) }
+    }
+
+    private fun ensureSpeechRecognizer(): SpeechRecognizer? {
+        speechRecognizer?.let { return it }
+        // Prefer the offline engine (low latency, no network); fall back to the
+        // cloud recognizer where on-device models are unavailable.
+        val recognizer = when {
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                SpeechRecognizer.isOnDeviceRecognitionAvailable(this) ->
+                SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            SpeechRecognizer.isRecognitionAvailable(this) ->
+                SpeechRecognizer.createSpeechRecognizer(this)
+            else -> return null
+        }
+        recognizer.setRecognitionListener(recognitionListener)
+        speechRecognizer = recognizer
+        return recognizer
+    }
+
+    private fun buildRecognizerIntent(): Intent =
+        Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(
+                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+            )
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault().toLanguageTag())
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        }
+
+    private fun onRecognizedText(raw: String) {
+        if (voiceConversation != VoiceConversation.LISTENING) return
+        // Auto-send must stay a single line: an embedded newline would submit
+        // more than the one utterance.
+        val text = raw.replace(Regex("[\r\n]+"), " ").trim()
+        if (text.isEmpty()) {
+            // Heard nothing usable: re-arm silently, still the same turn.
+            armListening()
+            return
+        }
+        Toast.makeText(this, getString(R.string.voice_sent_format, text), Toast.LENGTH_LONG).show()
+        // Submit the utterance, then Enter. The CR must not ride the same input
+        // burst as the text, or a TUI that coalesces the burst as a paste (e.g.
+        // Claude Code) folds it into the composer as a literal newline instead
+        // of submitting. With bracketed paste on, the end marker delimits the
+        // text so the following Enter is unambiguous and length-independent;
+        // otherwise fall back to sending Enter after a short delay — which a
+        // long utterance can outrun, hence the bracketed path is preferred.
+        if (isBracketedPasteActive()) {
+            writeToSsh(BRACKETED_PASTE_START)
+            writeToSsh(text.toByteArray(Charsets.UTF_8))
+            writeToSsh(BRACKETED_PASTE_END)
+            writeToSsh("\r".toByteArray(Charsets.UTF_8))
+            waitForVoiceReply()
+        } else {
+            writeToSsh(text.toByteArray(Charsets.UTF_8))
+            voiceHandler.postDelayed({
+                if (voiceConversation != VoiceConversation.LISTENING) return@postDelayed
+                writeToSsh("\r".toByteArray(Charsets.UTF_8))
+                waitForVoiceReply()
+            }, VOICE_SUBMIT_ENTER_DELAY_MS)
+        }
+    }
+
+    private fun onRecognizerError(error: Int) {
+        if (voiceConversation != VoiceConversation.LISTENING) return
+        // Silence, no match, and transient busy/client churn are all expected
+        // in a hands-free loop — re-arm rather than dropping out of the mode.
+        val delay = when (error) {
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> RECOGNIZER_BUSY_RETRY_MS
+            SpeechRecognizer.ERROR_NO_MATCH,
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT,
+            SpeechRecognizer.ERROR_CLIENT -> RECOGNIZER_RESTART_MS
+            else -> {
+                Log.w(TAG, "Speech recognizer error $error")
+                RECOGNIZER_RESTART_MS
+            }
+        }
+        restartListeningSoon(delay)
+    }
+
+    private fun restartListeningSoon(delayMs: Long) {
+        voiceHandler.postDelayed({
+            if (voiceConversation == VoiceConversation.LISTENING) armListening()
+        }, delayMs)
+    }
+
+    private fun waitForVoiceReply() {
+        val svc = service
+        if (svc == null) {
+            exitVoiceConversation()
+            return
+        }
+        voiceConversation = VoiceConversation.WAITING_REPLY
+        // Cue the handoff: utterance sent, now waiting on the reply.
+        playVoiceTone(TONE_WAITING)
+        binding.swipeFeedback.text = getString(R.string.voice_mode_waiting)
+        svc.execCommandForOutput(VOICE_REPLY_HELPER_CMD, ByteArray(0), VOICE_REPLY_TIMEOUT_MS) { result ->
+            if (voiceConversation != VoiceConversation.WAITING_REPLY) return@execCommandForOutput
+            val reply = result.getOrNull()
+                ?.takeIf { it.exitStatus == 0 }
+                ?.stdout?.trim().orEmpty()
+            if (reply.isEmpty()) {
+                // Timeout or failure: the loop should survive a missed reply —
+                // hand the turn back with the usual "your turn" cue.
+                startListeningTurn()
+            } else {
+                speakVoiceReply(reply)
+            }
+        }
+    }
+
+    private fun speakVoiceReply(reply: String) {
+        voiceConversation = VoiceConversation.SPEAKING
+        binding.swipeFeedback.text = reply
+        val tts = voiceTts
+        if (tts == null || !voiceTtsReady ||
+            tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "voice-reply") != TextToSpeech.SUCCESS
+        ) {
+            resumeListeningAfterSpeech()
+        }
+    }
+
+    private fun extensionForMime(mime: String): String = when (mime.lowercase()) {
+        "image/png" -> "png"
+        "image/jpeg", "image/jpg" -> "jpg"
+        "image/webp" -> "webp"
+        "image/gif" -> "gif"
+        "image/heic" -> "heic"
+        "image/heif" -> "heif"
+        else -> "png"
+    }
+
+    /**
+     * Open the two-way SCP/SFTP file browser, starting at the login home (`.`
+     * resolves to it server-side). Inside the browser the user navigates remote
+     * directories, taps a file to download it to the device Downloads folder, or
+     * taps "Upload here" to push a local file into the current directory.
+     */
+    private fun launchScpBrowser() {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        scpNavigate(".")
+    }
+
+    /** List [path] over SFTP and (re)render the browser dialog, or toast on failure. */
+    private fun scpNavigate(path: String) {
+        val svc = service ?: return
+        svc.listRemoteDir(path) { result ->
+            // The callback is posted to the main thread and may arrive after the
+            // Activity is gone (e.g. the connection dropped and we finished while
+            // the listing was in flight). Showing a dialog then crashes.
+            if (isFinishing || isDestroyed) return@listRemoteDir
+            result.fold(
+                onSuccess = { showScpListing(it) },
+                onFailure = { e ->
+                    // e.message is shown only in a local toast, never sent anywhere.
+                    Toast.makeText(
+                        this,
+                        getString(R.string.scp_list_failed, e.message ?: ""),
+                        Toast.LENGTH_LONG,
+                    ).show()
+                },
+            )
+        }
+    }
+
+    private fun showScpListing(listing: RemoteListing) {
+        val path = listing.path
+        val labels = mutableListOf<String>()
+        val onClick = mutableListOf<() -> Unit>()
+        if (path != "/") {
+            labels.add("⬆  ..")
+            onClick.add { scpNavigate(joinRemotePath(path, "..")) }
+        }
+        for (entry in listing.entries) {
+            if (entry.name == "." || entry.name == "..") continue
+            val target = joinRemotePath(path, entry.name)
+            if (entry.isDirectory) {
+                labels.add("📁  ${entry.name}/")
+                onClick.add { scpNavigate(target) }
+            } else {
+                labels.add("📄  ${entry.name}")
+                onClick.add { showScpFileActions(target, entry.name) }
+            }
+        }
+        val adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, labels)
+
+        val existing = scpBrowserDialog
+        if (existing != null && existing.isShowing) {
+            scpBrowserPathHeader?.text = path
+            scpBrowserListView?.let { list ->
+                list.adapter = adapter
+                list.setOnItemClickListener { _, _, pos, _ -> onClick[pos]() }
+            }
+            return
+        }
+
+        val pad = dpToPx(16)
+        val header = TextView(this).apply {
+            text = path
+            setPadding(pad, pad, pad, dpToPx(8))
+            setTypeface(typeface, Typeface.BOLD)
+        }
+        val list = ListView(this).apply {
+            this.adapter = adapter
+            setOnItemClickListener { _, _, pos, _ -> onClick[pos]() }
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(header)
+            addView(
+                list,
+                LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dpToPx(360)),
+            )
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.scp_browser_title)
+            .setView(container)
+            .setNeutralButton(R.string.scp_upload_here, null)
+            .setNegativeButton(android.R.string.cancel, null)
+            .create()
+        scpBrowserListView = list
+        scpBrowserPathHeader = header
+        scpBrowserDialog = dialog
+        dialog.setOnDismissListener {
+            scpBrowserDialog = null
+            scpBrowserListView = null
+            scpBrowserPathHeader = null
+        }
+        dialog.show()
+        // Override the neutral button after show() so it does NOT auto-dismiss
+        // on the navigation taps; for upload it reads the *current* directory
+        // (header text changes as the user navigates), then closes and opens
+        // the document picker.
+        dialog.getButton(DialogInterface.BUTTON_NEUTRAL).setOnClickListener {
+            scpUploadTargetDir = scpBrowserPathHeader?.text?.toString() ?: path
+            dialog.dismiss()
+            scpUploadPickerLauncher.launch(arrayOf("*/*"))
+        }
+    }
+
+    /** Join a remote dir and a child name with `/`; `..` is resolved server-side. */
+    private fun joinRemotePath(dir: String, name: String): String =
+        if (dir.endsWith("/")) "$dir$name" else "$dir/$name"
+
+    /** Offer Download (save to Downloads) or Copy (file contents to clipboard). */
+    private fun showScpFileActions(remotePath: String, displayName: String) {
+        val items = arrayOf(
+            getString(R.string.scp_file_action_download),
+            getString(R.string.scp_file_action_copy),
+        )
+        AlertDialog.Builder(this)
+            .setTitle(displayName)
+            .setItems(items) { _, which ->
+                when (which) {
+                    0 -> confirmScpDownload(remotePath, displayName)
+                    1 -> startScpCopyToClipboard(remotePath, displayName)
+                }
+            }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun confirmScpDownload(remotePath: String, displayName: String) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.scp_download_confirm_title)
+            .setMessage(getString(R.string.scp_download_confirm_message, displayName))
+            .setPositiveButton(android.R.string.ok) { _, _ -> startScpDownload(remotePath, displayName) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    /**
+     * Download [remotePath] into memory and put its contents on the clipboard as
+     * UTF-8 text. A cancelable progress dialog blocks until the SFTP worker
+     * finishes; canceling interrupts the worker.
+     */
+    private fun startScpCopyToClipboard(remotePath: String, displayName: String) {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val out = java.io.ByteArrayOutputStream()
+        val cancelled = AtomicBoolean(false)
+        val dialog = buildScpProgressDialog(R.string.scp_copying)
+        val future = svc.downloadFile(remotePath, out) { error ->
+            if (cancelled.get()) return@downloadFile
+            if (isFinishing || isDestroyed) return@downloadFile
+            scpTransferDialog = null
+            dialog.dismiss()
+            if (error == null) {
+                val text = out.toString(Charsets.UTF_8.name())
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                clipboard.setPrimaryClip(ClipData.newPlainText(displayName, text))
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_copy_done, displayName),
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_copy_failed, error.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        dialog.setButton(
+            DialogInterface.BUTTON_NEGATIVE,
+            getString(android.R.string.cancel),
+        ) { _, _ ->
+            cancelled.set(true)
+            scpTransferDialog = null
+            future?.cancel(true)
+            Toast.makeText(this, R.string.scp_copy_cancelled, Toast.LENGTH_SHORT).show()
+        }
+        scpTransferDialog = dialog
+        dialog.show()
+    }
+
+    /**
+     * Download [remotePath] into a new MediaStore Downloads entry named
+     * [displayName]. A cancelable progress dialog blocks until the SFTP worker
+     * finishes; canceling interrupts the worker and removes the pending entry.
+     */
+    private fun startScpDownload(remotePath: String, displayName: String) {
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val resolver = contentResolver
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, displayName)
+            put(MediaStore.Downloads.IS_PENDING, 1)
+        }
+        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        val targetUri = resolver.insert(collection, values)
+        if (targetUri == null) {
+            Toast.makeText(this, getString(R.string.scp_download_failed, ""), Toast.LENGTH_LONG).show()
+            return
+        }
+        val out = try {
+            resolver.openOutputStream(targetUri)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open download sink")
             null
         }
-        if (bytes == null) {
-            Toast.makeText(this, R.string.image_upload_read_failed, Toast.LENGTH_SHORT).show()
+        if (out == null) {
+            resolver.delete(targetUri, null, null)
+            Toast.makeText(this, getString(R.string.scp_download_failed, ""), Toast.LENGTH_LONG).show()
             return
         }
 
         val cancelled = AtomicBoolean(false)
+        val dialog = buildScpProgressDialog(R.string.scp_downloading)
+        val future = svc.downloadFile(remotePath, out) { error ->
+            try { out.close() } catch (_: Exception) {}
+            if (cancelled.get()) return@downloadFile
+            if (isFinishing || isDestroyed) {
+                // Activity gone before the transfer finished; leave the pending
+                // MediaStore entry for the system to reap rather than touching UI.
+                return@downloadFile
+            }
+            scpTransferDialog = null
+            dialog.dismiss()
+            if (error == null) {
+                val done = ContentValues().apply { put(MediaStore.Downloads.IS_PENDING, 0) }
+                resolver.update(targetUri, done, null, null)
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_download_done, displayName),
+                    Toast.LENGTH_LONG,
+                ).show()
+            } else {
+                resolver.delete(targetUri, null, null)
+                Toast.makeText(
+                    this,
+                    getString(R.string.scp_download_failed, error.message ?: ""),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+        dialog.setButton(
+            DialogInterface.BUTTON_NEGATIVE,
+            getString(android.R.string.cancel),
+        ) { _, _ ->
+            cancelled.set(true)
+            scpTransferDialog = null
+            future?.cancel(true)
+            try { out.close() } catch (_: Exception) {}
+            resolver.delete(targetUri, null, null)
+            Toast.makeText(this, R.string.scp_download_cancelled, Toast.LENGTH_SHORT).show()
+        }
+        scpTransferDialog = dialog
+        dialog.show()
+    }
+
+    /** Upload the SAF-picked [uri] into [scpUploadTargetDir] captured at pick time. */
+    private fun onScpUploadFilePicked(uri: Uri) {
+        val remoteDir = scpUploadTargetDir
+        scpUploadTargetDir = null
+        if (remoteDir == null) return
+        val svc = service
+        if (svc == null || svc.state != SshConnectionService.State.CONNECTED) {
+            Toast.makeText(this, R.string.image_upload_not_connected, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val displayName = queryDisplayName(uri) ?: "upload.bin"
+        // Runs in the background; progress and result surface through the
+        // service notification, so the terminal stays usable during the upload.
+        svc.uploadFile(
+            { contentResolver.openInputStream(uri) ?: throw IOException("Cannot open picked file") },
+            displayName,
+            remoteDir,
+            queryFileSize(uri),
+        ) {}
+    }
+
+    private fun queryDisplayName(uri: Uri): String? =
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0) else null
+        }
+
+    /** Picked-file size in bytes for the upload progress bar, or -1 if unknown. */
+    private fun queryFileSize(uri: Uri): Long =
+        contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else -1L
+        } ?: -1L
+
+    /** A non-cancelable-by-back, indeterminate progress dialog for an SCP transfer. */
+    private fun buildScpProgressDialog(titleRes: Int): AlertDialog {
         val padding = dpToPx(24)
         val progressView = ProgressBar(this).apply { isIndeterminate = true }
         val container = FrameLayout(this).apply {
@@ -923,53 +1875,11 @@ class TerminalActivity : AppCompatActivity() {
                 ),
             )
         }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle(R.string.image_upload_in_progress)
+        return AlertDialog.Builder(this)
+            .setTitle(titleRes)
             .setView(container)
             .setCancelable(false)
             .create()
-
-        val uploadFuture = svc.uploadBytes(bytes, filename, REMOTE_TMP_DIR) { error ->
-            if (cancelled.get()) return@uploadBytes
-            uploadDialog = null
-            if (error == null) {
-                // Kick off the SSH write before dismiss() so the SSH round-trip
-                // overlaps the dialog's exit animation; otherwise the path
-                // appears noticeably after the dialog disappears.
-                val pathRef = "$REMOTE_TMP_DIR/$filename "
-                writeToSsh(pathRef.toByteArray(Charsets.UTF_8))
-            }
-            dialog.dismiss()
-            if (error != null) {
-                Toast.makeText(
-                    this,
-                    getString(R.string.image_upload_failed, error.message ?: ""),
-                    Toast.LENGTH_LONG,
-                ).show()
-            }
-        }
-
-        dialog.setButton(
-            DialogInterface.BUTTON_NEGATIVE,
-            getString(R.string.image_upload_cancel),
-        ) { _, _ ->
-            cancelled.set(true)
-            uploadDialog = null
-            uploadFuture?.cancel(true)
-            Toast.makeText(this, R.string.image_upload_cancelled, Toast.LENGTH_SHORT).show()
-        }
-        uploadDialog = dialog
-        dialog.show()
-    }
-
-    private fun extensionForMime(mime: String): String = when (mime.lowercase()) {
-        "image/png" -> "png"
-        "image/jpeg", "image/jpg" -> "jpg"
-        "image/webp" -> "webp"
-        "image/gif" -> "gif"
-        "image/heic" -> "heic"
-        "image/heif" -> "heif"
-        else -> "png"
     }
 
     private fun auxButtonLayoutParams(): LinearLayout.LayoutParams {
@@ -1278,8 +2188,7 @@ class TerminalActivity : AppCompatActivity() {
      * `TerminalView.onUp` would emit `MOUSE_LEFT_BUTTON` press/release via
      * `emulator.sendMouseEvent`, again echoing through the dummy pty as
      * `^[[<0;x;yM^[[<0;x;ym…`. We swallow the tap-up, then do
-     * `requestFocus()` + `toggleSoftKeyboard()` ourselves so the user's
-     * existing tap-to-toggle-keyboard behavior is preserved.
+     * `requestFocus()` ourselves so the IME proxy stays the IME target.
      *
      * For pinches and for taps in plain-shell mode we leave events untouched.
      */
@@ -1287,12 +2196,37 @@ class TerminalActivity : AppCompatActivity() {
     private fun setupTerminalScrollRouting() {
         val detector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onDown(e: MotionEvent): Boolean {
+                // A new touch grabs the transcript immediately instead of
+                // fighting a still-running fling animation.
+                abortFling(binding.terminalView)
                 scrollRemainderPx = 0f
                 handlingScrollGesture = false
+                nativeFlingClaimed = false
                 tappedThisGesture = false
                 gestureAxis = GestureAxis.UNDETERMINED
                 pendingSwipeDirection = 0
                 return false
+            }
+
+            override fun onFling(
+                e1: MotionEvent?,
+                e2: MotionEvent,
+                velocityX: Float,
+                velocityY: Float,
+            ): Boolean {
+                // Only the native scrollback path (case 3): mouse/dpad routing
+                // and horizontal swipes have no inertia to begin with.
+                if (gestureAxis != GestureAxis.VERTICAL || handlingScrollGesture) return false
+                val emu = binding.terminalView.mEmulator ?: return false
+                if (emu.isMouseTrackingActive || emu.isAlternateBufferActive) return false
+                // TerminalView's own onFling feeds the pixel velocity (x0.25)
+                // into a row-unit Scroller — roughly 10x the finger speed.
+                // Claim the gesture and fling in row units instead; the UP is
+                // then replayed to TerminalView as CANCEL so its fling never
+                // starts.
+                flingScrollback(binding.terminalView, velocityY)
+                nativeFlingClaimed = true
+                return true
             }
 
             override fun onSingleTapUp(e: MotionEvent): Boolean {
@@ -1415,7 +2349,7 @@ class TerminalActivity : AppCompatActivity() {
             detector.onTouchEvent(event)
             val inMouseTracking = binding.terminalView.mEmulator?.isMouseTrackingActive == true
             val tapInMouseTracking = tappedThisGesture && inMouseTracking
-            var consume = handlingScrollGesture || tapInMouseTracking
+            var consume = handlingScrollGesture || tapInMouseTracking || nativeFlingClaimed
             when (event.action) {
                 MotionEvent.ACTION_UP -> {
                     // Tapped a URL? Open it (with confirmation) instead of
@@ -1440,10 +2374,10 @@ class TerminalActivity : AppCompatActivity() {
                     if (pendingSwipeDirection != 0) commitPendingSwipe()
                     if (tapInMouseTracking && !openedLink) {
                         binding.imeProxy.requestFocus()
-                        toggleSoftKeyboard()
                     }
                     hideSwipeFeedback()
                     handlingScrollGesture = false
+                    nativeFlingClaimed = false
                     tappedThisGesture = false
                     gestureAxis = GestureAxis.UNDETERMINED
                     pendingSwipeDirection = 0
@@ -1451,6 +2385,7 @@ class TerminalActivity : AppCompatActivity() {
                 MotionEvent.ACTION_CANCEL -> {
                     hideSwipeFeedback()
                     handlingScrollGesture = false
+                    nativeFlingClaimed = false
                     tappedThisGesture = false
                     gestureAxis = GestureAxis.UNDETERMINED
                     pendingSwipeDirection = 0
@@ -1472,6 +2407,11 @@ class TerminalActivity : AppCompatActivity() {
 
     private fun showSwipeFeedback(direction: Int) {
         val shortcut = activeSwipeShortcut(direction) ?: return
+        showPayloadFeedback(shortcut)
+    }
+
+    /** Show [shortcut]'s label and resolved payload in the center overlay. */
+    private fun showPayloadFeedback(shortcut: Shortcut) {
         val preview = previewSwipePayload(shortcut.payload)
         binding.swipeFeedback.text = getString(R.string.swipe_feedback, shortcut.label, preview)
         binding.swipeFeedback.visibility = View.VISIBLE
@@ -1511,6 +2451,10 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     private fun writeToSsh(data: ByteArray) {
+        // Typing while scrolled back snaps the view to the live screen, the
+        // way a desktop terminal does — otherwise whatever the remote echoes
+        // for these bytes renders below the viewport and looks like lost input.
+        scrollToBottom(binding.terminalView)
         service?.writeToSsh(data)
         if (secureInputActive) {
             // Bytes during secure input are deliberately kept out of the
@@ -1533,13 +2477,17 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     /**
-     * Map a tap on the terminal to a URL, if the tapped word resolves to one.
+     * Map a tap on the terminal to a URL, if one sits at or near the tap.
      * Returns true (and shows the confirm dialog) when a URL is found, in
      * which case the caller should suppress the default tap behaviour.
      *
+     * The whole wrapped line is scanned (not just the tapped word), so a tap
+     * landing on prose next to a link still opens it, and the tapped row plus
+     * the two rows above and below are checked so a slightly-off tap counts.
+     *
      * Bounded to the visible screen rows so that scrollback (`mTopRow < 0`)
-     * is not handled — `TerminalBuffer.getWordAtLocation` only walks
-     * line-wrap continuations in the screen range, not the transcript.
+     * is not handled — the wrapped-line walk only follows line-wrap
+     * continuations in the screen range, not the transcript.
      */
     private fun tryOpenLinkAt(event: MotionEvent): Boolean {
         val terminalView = binding.terminalView
@@ -1547,13 +2495,44 @@ class TerminalActivity : AppCompatActivity() {
         val coords = terminalView.getColumnAndRow(event, true)
         val column = coords[0]
         val row = coords[1]
-        if (row < 0 || row >= emulator.mRows) return false
         if (column < 0 || column >= emulator.mColumns) return false
-        val word = emulator.screen.getWordAtLocation(column, row)
-        if (word.isNullOrBlank()) return false
-        val url = LinkDetector.extractUrls(word).firstOrNull() ?: return false
-        showOpenLinkConfirmDialog(url)
-        return true
+        for (candidate in intArrayOf(row, row - 1, row + 1, row - 2, row + 2)) {
+            if (candidate < 0 || candidate >= emulator.mRows) continue
+            val url = findUrlNearTap(emulator, column, candidate) ?: continue
+            showOpenLinkConfirmDialog(url)
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Scan the whole wrapped line that `row` belongs to and return the URL
+     * nearest the tapped column, or null if the line holds none.
+     *
+     * The wrap walk and offset arithmetic mirror
+     * `TerminalBuffer.getWordAtLocation`: rows before the last one in a wrapped
+     * line are full-width, so the flat text offset of the tap is
+     * `(row - y1) * columns + column`.
+     */
+    private fun findUrlNearTap(emulator: TerminalEmulator, column: Int, row: Int): String? {
+        val screen = emulator.screen
+        val cols = emulator.mColumns
+        val rows = emulator.mRows
+        var y1 = row
+        var y2 = row
+        while (y1 > 0 && !screen.getSelectedText(0, y1 - 1, cols, row, true, true).contains('\n')) y1--
+        while (y2 < rows && !screen.getSelectedText(0, row, cols, y2 + 1, true, true).contains('\n')) y2++
+        val text = screen.getSelectedText(0, y1, cols, y2, true, true)
+        val matches = LinkDetector.extractUrlMatches(text)
+        if (matches.isEmpty()) return null
+        val tapOffset = (row - y1) * cols + column
+        return matches.minByOrNull { match ->
+            when {
+                tapOffset < match.start -> match.start - tapOffset
+                tapOffset >= match.endExclusive -> tapOffset - match.endExclusive + 1
+                else -> 0
+            }
+        }?.url
     }
 
     private fun showOpenLinkConfirmDialog(url: String) {
@@ -1658,17 +2637,39 @@ class TerminalActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
-        uploadDialog?.dismiss()
-        uploadDialog = null
+        // Reject a host-key dialog still showing at teardown: force-closing its
+        // window does not fire the button listeners, so the ssh-read thread
+        // parked on take() would hang forever. offer() (not put()) avoids
+        // blocking here — if the receiver already took a value it simply fails
+        // and is harmless.
+        hostKeyResultQueue?.offer(false)
+        hostKeyResultQueue = null
+        hostKeyDialog?.dismiss()
+        hostKeyDialog = null
+        exitVoiceConversation()
+        voiceTts?.shutdown()
+        voiceTts = null
+        scpBrowserDialog?.dismiss()
+        scpBrowserDialog = null
+        scpTransferDialog?.dismiss()
+        scpTransferDialog = null
         pendingTitleHandler.removeCallbacks(pendingTitleRunnable)
         if (bound) {
             service?.detachOutputListener()
+            service?.detachControlListener()
             service?.removeStatusListener(statusListener)
+            service?.setVoiceListener(null)
             unbindService(serviceConnection)
             bound = false
             service = null
         }
-        biometricExecutor.shutdownNow()
+        paneManager?.finishAll()
+        // Graceful shutdown (not shutdownNow): if a biometric prompt is being
+        // dismissed by this very teardown, its error callback is already queued
+        // on this executor and must still run so it unblocks the ssh-read thread
+        // parked on the result queue. shutdownNow would drop that task and leave
+        // the connection wedged in CONNECTING forever.
+        biometricExecutor.shutdown()
         binding.terminalView.mTermSession?.finishIfRunning()
         super.onDestroy()
     }
@@ -1679,6 +2680,12 @@ class TerminalActivity : AppCompatActivity() {
             binding.terminalView.invalidate()
         }
         override fun onTitleChanged(changedSession: TerminalSession) {
+            // Control mode: pane titles are whatever the foreground app set
+            // (Claude Code animates a spinner there several times a second),
+            // not the TmuxTitle wire format — and every pane fires this
+            // callback. Parsing them would thrash applyContext and the
+            // shortcut bar; the app context comes from list-windows instead.
+            if (paneManager != null) return
             val title = changedSession.title
             // Cache on the service so a subsequent activity instance can pick
             // up the active app context without waiting for tmux to re-emit
@@ -1729,11 +2736,10 @@ class TerminalActivity : AppCompatActivity() {
             return scale
         }
         override fun onSingleTapUp(e: MotionEvent?) {
-            // Tapping the terminal toggles the soft keyboard so it can be
-            // re-summoned after the user dismisses it with the back gesture.
-            // Focus stays on the IME proxy view (it's the IME target).
+            // Keep focus on the IME proxy view (it's the IME target). The
+            // keyboard itself is summoned via the keyboard button above the
+            // FAB, never by tapping the terminal.
             binding.imeProxy.requestFocus()
-            toggleSoftKeyboard()
         }
         override fun shouldBackButtonBeMappedToEscape(): Boolean = true
         override fun shouldEnforceCharBasedInput(): Boolean = true
@@ -1802,6 +2808,7 @@ class TerminalActivity : AppCompatActivity() {
         const val EXTRA_PORT = "port"
         const val EXTRA_USERNAME = "username"
         const val EXTRA_USE_TMUX = "use_tmux"
+        const val EXTRA_TMUX_CONTROL_MODE = "tmux_control_mode"
         // Deeplink (pss://open?window=...) target. When present, switch to
         // the named tmux window once the SSH session is connected.
         const val EXTRA_TMUX_WINDOW = "tmux_window"
@@ -1822,6 +2829,10 @@ class TerminalActivity : AppCompatActivity() {
         private const val DEFAULT_TMUX_PREFIX_LETTER = "b"
         private const val TAG = "TerminalActivity"
         private const val FAB_COLLAPSED_ALPHA = 0.3f
+        private const val FAB_MAX_COLUMNS = 3
+        private const val CTRL_INPUT_COLUMNS = 4
+        private val CTRL_INPUT_PRESETS =
+            listOf("^C", "^D", "^L", "^R", "^Z", "^A", "^E", "^U", "^K", "^W", "^[")
         private const val PROBE_TIMEOUT_MS = 4_000L
 
         // Rolling window of SSH output kept around for password-prompt
@@ -1869,6 +2880,42 @@ class TerminalActivity : AppCompatActivity() {
         // Picked images are uploaded under /tmp on the remote host so they
         // are wiped automatically on reboot — no explicit cleanup is needed.
         private const val REMOTE_TMP_DIR = "/tmp"
+
+        // Conversation mode. The on-device recognizer does its own endpointing,
+        // so the only tuning left is how fast to re-arm after a pass ends: a
+        // short pause after no-match/silence, a longer one after BUSY so a
+        // still-tearing-down session has time to free up. The reply timeout sits
+        // above the remote waiter's own 600 s timeout so the remote side decides.
+        private const val RECOGNIZER_RESTART_MS = 300L
+        private const val RECOGNIZER_BUSY_RETRY_MS = 600L
+        // Gap between the recognized text and its submitting Enter, so a
+        // paste-coalescing TUI sees the CR as a discrete keypress, not as part
+        // of the pasted utterance.
+        private const val VOICE_SUBMIT_ENTER_DELAY_MS = 200L
+        private const val VOICE_REPLY_TIMEOUT_MS = 660_000L
+
+        // Conversation mode's reply command is pss's own bundled helper
+        // (res/raw/voice_reply_wait), installed under the XDG data dir on first
+        // use. Bumping VOICE_HELPER_VERSION re-pushes it on the next entry; the
+        // installed version is tracked in KEY_VOICE_HELPER_VERSION. The helper
+        // and the server-side hook share the spool contract under the XDG cache
+        // dir (~/.cache/pocketssh/voice-reply-spool). The shell expands
+        // $XDG_DATA_HOME/$HOME remote-side.
+        private const val VOICE_HELPER_DIR = "\${XDG_DATA_HOME:-\$HOME/.local/share}/pocketssh"
+        private const val VOICE_HELPER_PATH = "$VOICE_HELPER_DIR/voice-reply-wait"
+        private const val VOICE_REPLY_HELPER_CMD = VOICE_HELPER_PATH
+        private const val VOICE_HELPER_INSTALL_CMD =
+            "mkdir -p $VOICE_HELPER_DIR && cat > $VOICE_HELPER_PATH && chmod 755 $VOICE_HELPER_PATH"
+        private const val VOICE_HELPER_INSTALL_TIMEOUT_MS = 10_000L
+        private const val VOICE_HELPER_VERSION = 2
+        private const val KEY_VOICE_HELPER_VERSION = "voice_helper_version"
+        // State earcons: a rising double beep means "your turn to speak"; a
+        // single ack means "sent, waiting for the reply". Kept distinct so the
+        // loop's state is recognizable by ear alone.
+        private const val VOICE_TONE_VOLUME = 80
+        private const val TONE_LISTENING = ToneGenerator.TONE_PROP_BEEP2
+        private const val TONE_WAITING = ToneGenerator.TONE_PROP_ACK
+        private val VOICE_MODE_ACTIVE_COLOR = 0xFFEF5350.toInt()
 
         // Number of learned candidates to render in the suggestions row. Sized
         // a touch under the always row's eight buttons so the learned row

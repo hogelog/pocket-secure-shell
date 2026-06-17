@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# pss voice conversation mode の reply command。
+#
+# pss が会話モード開始時にこのスクリプトをリモートへ自動インストールして
+# ($XDG_DATA_HOME/pocketssh/voice-reply-wait, 既定 ~/.local/share/...)、各
+# 発話のあと exec する。pss 側で内容を
+# 所有するので、利用者が設定で用意する必要はない。spool の規約 (パス・
+# ファイル名・マーカー命名) が pss とサーバ側フック (yobidashi-turn-notify)
+# の契約。
+#
+# 待機マーカーを置いて spool (フックが書く要約テキスト) を監視し、自分の
+# 開始より新しい要約が現れたらそれを stdout に出して消費する。spool ファイル
+# 名は <time_ns>.txt なので、開始時刻との比較は名前で行う (mtime 比較は
+# マーカー touch とのレースがある)。
+#
+# マーカーが生きている (60 秒以内に touch されている) 間、フックは閾値に
+# 関わらず要約を spool に書き、ntfy をスキップする (pss 側 TTS との二重
+# 読み上げ防止)。trap が走らず死んだ waiter は touch が止まるのでフック側で
+# stale 判定される。
+#
+# タイムアウト (default 600s) で exit 1 — pss は何も読み上げず聞き取りに戻る。
+set -euo pipefail
+
+SPOOL="${XDG_CACHE_HOME:-$HOME/.cache}/pocketssh/voice-reply-spool"
+TIMEOUT="${VOICE_REPLY_TIMEOUT:-600}"
+
+mkdir -p "$SPOOL"
+marker="$SPOOL/.waiting-$$"
+touch "$marker"
+trap 'rm -f "$marker"' EXIT
+
+# 消費されなかった古い要約の掃除
+find "$SPOOL" -maxdepth 1 -name '*.txt' -type f -mmin +60 -delete
+
+start_ns=$(date +%s%N)
+start_s=${start_ns%?????????}
+while :; do
+  # grep は no-match で exit 1 を返すので set -e/pipefail から外す
+  f=$(ls "$SPOOL" 2>/dev/null | grep -E '^[0-9]+\.txt$' | sort -n |
+    awk -F. -v s="$start_ns" '$1 > s { print; exit }') || true
+  if [ -n "$f" ]; then
+    cat "$SPOOL/$f"
+    rm -f "$SPOOL/$f"
+    exit 0
+  fi
+  [ $(( $(date +%s) - start_s )) -ge "$TIMEOUT" ] && exit 1
+  touch "$marker"
+  sleep 0.5
+done

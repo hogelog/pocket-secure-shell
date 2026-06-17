@@ -58,16 +58,16 @@ class ShortcutStore(context: Context) {
                 name = "always",
                 shortcuts = listOf(
                     Shortcut("TAB", "{TAB}"),
-                    Shortcut("^L", "^L"),
-                    Shortcut("^R", "^R"),
+                    Shortcut("^C", "^C"),
                     Shortcut("↓", "{DOWN}"),
                     Shortcut("↑", "{UP}"),
-                    Shortcut("^C", "^C"),
-                    Shortcut("^D", "^D"),
                 ),
                 fabItems = listOf(
+                    Shortcut("\uD83D\uDD12", "{SECURE-INPUT}"), // 🔒 secure input toggle
+                    Shortcut("⌨️", "{CTRL-INPUT}"), // control-input dialog (^C/^D/^L/^R/…)
                     Shortcut("\uD83D\uDDBC", "{IMAGE-PASTE}"), // 🖼 image picker
                     Shortcut("\uD83D\uDCCB", "{COPY}"),        // 📋 selection mode
+                    Shortcut("\uD83D\uDCC1", "{SCP}"),         // 📁 remote file browser
                 ),
             ),
             // Swipe direction mirrors the FAB arrows: ⬅️ / swipe-left =

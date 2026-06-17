@@ -306,6 +306,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(TerminalActivity.EXTRA_PORT, port)
             putExtra(TerminalActivity.EXTRA_USERNAME, username)
             putExtra(TerminalActivity.EXTRA_USE_TMUX, useTmux)
+            putExtra(TerminalActivity.EXTRA_TMUX_CONTROL_MODE, prefs.getBoolean(KEY_TMUX_CONTROL_MODE, false))
             putExtra(TerminalActivity.EXTRA_TMUX_WINDOW, window)
         }
         startActivity(forward)
@@ -327,6 +328,7 @@ class MainActivity : AppCompatActivity() {
             putExtra(TerminalActivity.EXTRA_PORT, port)
             putExtra(TerminalActivity.EXTRA_USERNAME, username)
             putExtra(TerminalActivity.EXTRA_USE_TMUX, binding.switchUseTmux.isChecked)
+            putExtra(TerminalActivity.EXTRA_TMUX_CONTROL_MODE, binding.switchControlMode.isChecked)
         }
         startActivity(intent)
     }
@@ -389,6 +391,7 @@ class MainActivity : AppCompatActivity() {
         prefs.getString(KEY_PORT, null)?.let { binding.editPort.setText(it) }
         prefs.getString(KEY_USERNAME, null)?.let { binding.editUsername.setText(it) }
         binding.switchUseTmux.isChecked = prefs.getBoolean(KEY_USE_TMUX, true)
+        binding.switchControlMode.isChecked = prefs.getBoolean(KEY_TMUX_CONTROL_MODE, false)
         tmuxPrefix = normalizeTmuxPrefix(prefs.getString(KEY_TMUX_PREFIX, DEFAULT_TMUX_PREFIX))
     }
 
@@ -398,6 +401,7 @@ class MainActivity : AppCompatActivity() {
             putString(KEY_PORT, binding.editPort.text.toString())
             putString(KEY_USERNAME, binding.editUsername.text.toString())
             putBoolean(KEY_USE_TMUX, binding.switchUseTmux.isChecked)
+            putBoolean(KEY_TMUX_CONTROL_MODE, binding.switchControlMode.isChecked)
             putString(KEY_TMUX_PREFIX, tmuxPrefix)
         }
     }
@@ -487,6 +491,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun applyTmuxExpanded(expanded: Boolean) {
         binding.containerTmux.visibility = if (expanded) View.VISIBLE else View.GONE
+        // Control-mode toggle belongs to the tmux section, so it collapses
+        // along with it.
+        binding.switchControlMode.visibility =
+            if (expanded) View.VISIBLE else View.GONE
         binding.textTmuxSummary.visibility = if (expanded) View.GONE else View.VISIBLE
         binding.iconTmuxChevron.rotation = if (expanded) 180f else 0f
         if (!expanded) {
@@ -563,6 +571,9 @@ class MainActivity : AppCompatActivity() {
         internal const val KEY_USE_TMUX = "use_tmux"
         internal const val KEY_TMUX_PREFIX = "tmux_prefix"
         private const val DEFAULT_TMUX_PREFIX = "b"
+        // Experimental tmux control-mode (`tmux -CC`) opt-in. Debug builds only;
+        // not part of SettingsBackup. Removed once control mode is the default.
+        private const val KEY_TMUX_CONTROL_MODE = "tmux_control_mode"
 
         // Hidden diagnostic menu, unlocked the same way Android's Developer
         // options screen reveals itself. Kept in its own prefs file so it
