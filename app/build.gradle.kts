@@ -102,7 +102,7 @@ configurations.configureEach {
 
 android {
     namespace = "org.hogel.pocketssh"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "org.hogel.pocketssh"
