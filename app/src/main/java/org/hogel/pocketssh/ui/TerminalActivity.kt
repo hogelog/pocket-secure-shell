@@ -2485,9 +2485,11 @@ class TerminalActivity : AppCompatActivity() {
      * landing on prose next to a link still opens it, and the tapped row plus
      * the two rows above and below are checked so a slightly-off tap counts.
      *
-     * Bounded to the visible screen rows so that scrollback (`mTopRow < 0`)
-     * is not handled — the wrapped-line walk only follows line-wrap
-     * continuations in the screen range, not the transcript.
+     * `getColumnAndRow(event, true)` returns an absolute row in the external
+     * coordinate system (`-activeTranscriptRows .. mRows - 1`), so a tap while
+     * scrolled back (`mTopRow < 0`) lands on a negative row. The candidate row
+     * is bounded to that range — not to the visible screen — so links in the
+     * scrollback can be tapped too.
      */
     private fun tryOpenLinkAt(event: MotionEvent): Boolean {
         val terminalView = binding.terminalView
@@ -2496,8 +2498,9 @@ class TerminalActivity : AppCompatActivity() {
         val column = coords[0]
         val row = coords[1]
         if (column < 0 || column >= emulator.mColumns) return false
+        val minRow = -emulator.screen.activeTranscriptRows
         for (candidate in intArrayOf(row, row - 1, row + 1, row - 2, row + 2)) {
-            if (candidate < 0 || candidate >= emulator.mRows) continue
+            if (candidate < minRow || candidate >= emulator.mRows) continue
             val url = findUrlNearTap(emulator, column, candidate) ?: continue
             showOpenLinkConfirmDialog(url)
             return true
@@ -2518,9 +2521,10 @@ class TerminalActivity : AppCompatActivity() {
         val screen = emulator.screen
         val cols = emulator.mColumns
         val rows = emulator.mRows
+        val minRow = -screen.activeTranscriptRows
         var y1 = row
         var y2 = row
-        while (y1 > 0 && !screen.getSelectedText(0, y1 - 1, cols, row, true, true).contains('\n')) y1--
+        while (y1 > minRow && !screen.getSelectedText(0, y1 - 1, cols, row, true, true).contains('\n')) y1--
         while (y2 < rows && !screen.getSelectedText(0, row, cols, y2 + 1, true, true).contains('\n')) y2++
         val text = screen.getSelectedText(0, y1, cols, y2, true, true)
         val matches = LinkDetector.extractUrlMatches(text)
