@@ -217,7 +217,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
     // Sentry is debug-only — release builds ship without the SDK so the app
     // makes no telemetry phone-home in production.
-    debugImplementation("io.sentry:sentry-android:8.43.1")
+    debugImplementation("io.sentry:sentry-android:8.43.2")
 
     // Pinned to stabilize dependency locking: AGP's data binding transforms
     // resolve kotlin-stdlib-common at build time, but `--write-locks` doesn't
@@ -225,7 +225,7 @@ dependencies {
     // with the Kotlin bundled by AGP — bumping AGP requires re-pinning here.
     // (In Kotlin 2.0+ this artifact is an empty KMP metadata jar on the JVM,
     // so pinning has no runtime cost.)
-    implementation("org.jetbrains.kotlin:kotlin-stdlib-common:2.3.21")
+    implementation("org.jetbrains.kotlin:kotlin-stdlib-common:2.4.0")
 
     testImplementation("junit:junit:4.13.2")
 }
