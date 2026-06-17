@@ -16,3 +16,7 @@ updates:
       gradle:
         patterns:
           - "*"
+    ignore:
+      # Pinned in app/build.gradle.kts to the Kotlin bundled by AGP; newer
+      # versions break compileDebugKotlin with a metadata version mismatch.
+      - dependency-name: "org.jetbrains.kotlin:kotlin-stdlib-common"
