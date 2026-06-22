@@ -23,9 +23,30 @@ class BigramStore(context: Context) {
     fun record(context: String, prev: String, next: String) {
         if (next.isEmpty()) return
         helper.writableDatabase.execSQL(
-            "INSERT INTO bigram(context, prev, next, count) VALUES(?,?,?,1) " +
-                "ON CONFLICT(context, prev, next) DO UPDATE SET count = count + 1",
-            arrayOf(context, prev, next),
+            "INSERT INTO bigram(context, prev, next, count, last_used) VALUES(?,?,?,1,?) " +
+                "ON CONFLICT(context, prev, next) DO UPDATE SET " +
+                "count = count + 1, last_used = excluded.last_used",
+            arrayOf(context, prev, next, System.currentTimeMillis()),
+        )
+    }
+
+    /**
+     * Drop bigrams that have fallen out of use: within each `(context, prev)`
+     * group keep the [keepTop] highest-count rows, and delete any of the rest
+     * that have not been recorded in the last [maxAgeMillis]. Rows still in the
+     * per-group top [keepTop] are never touched however stale, so a command you
+     * lean on but haven't run lately keeps its suggestions. Ranking ties break
+     * the same way [topNext] orders, so a kept row is always one that could
+     * still surface in the suggestion bar.
+     */
+    fun prune(keepTop: Int = DEFAULT_KEEP_TOP, maxAgeMillis: Long = DEFAULT_MAX_AGE_MILLIS) {
+        val cutoff = System.currentTimeMillis() - maxAgeMillis
+        helper.writableDatabase.execSQL(
+            "DELETE FROM bigram WHERE last_used < ? AND (" +
+                "SELECT COUNT(*) FROM bigram AS b2 WHERE b2.context = bigram.context " +
+                "AND b2.prev = bigram.prev AND (b2.count > bigram.count " +
+                "OR (b2.count = bigram.count AND b2.next < bigram.next))) >= ?",
+            arrayOf(cutoff, keepTop),
         )
     }
 
@@ -118,17 +139,21 @@ class BigramStore(context: Context) {
      */
     fun replaceAll(rows: List<Bigram>) {
         val db = helper.writableDatabase
+        // Imported rows carry no usage time; seed them with the import time so a
+        // freshly restored backup gets a full window before prune() can touch it.
+        val now = System.currentTimeMillis()
         db.beginTransaction()
         try {
             db.delete("bigram", null, null)
             val stmt = db.compileStatement(
-                "INSERT INTO bigram(context, prev, next, count) VALUES(?,?,?,?)",
+                "INSERT INTO bigram(context, prev, next, count, last_used) VALUES(?,?,?,?,?)",
             )
             for (r in rows) {
                 stmt.bindString(1, r.context)
                 stmt.bindString(2, r.prev)
                 stmt.bindString(3, r.next)
                 stmt.bindLong(4, r.count.toLong())
+                stmt.bindLong(5, now)
                 stmt.executeInsert()
                 stmt.clearBindings()
             }
@@ -152,6 +177,7 @@ class BigramStore(context: Context) {
                     prev TEXT NOT NULL,
                     next TEXT NOT NULL,
                     count INTEGER NOT NULL DEFAULT 0,
+                    last_used INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(context, prev, next)
                 )
                 """.trimIndent(),
@@ -159,8 +185,16 @@ class BigramStore(context: Context) {
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            // No upgrades yet. When the schema changes, decide per-migration
-            // whether the learned data is worth migrating or can be wiped.
+            if (oldVersion < 2) {
+                // last_used backs the age-based prune(). Backfill existing rows
+                // to the upgrade time so pre-migration history gets a fresh
+                // window instead of being pruned away on the first run.
+                db.execSQL("ALTER TABLE bigram ADD COLUMN last_used INTEGER NOT NULL DEFAULT 0")
+                db.execSQL(
+                    "UPDATE bigram SET last_used = ?",
+                    arrayOf(System.currentTimeMillis()),
+                )
+            }
         }
     }
 
@@ -169,7 +203,13 @@ class BigramStore(context: Context) {
         const val ENTER = "<ENTER>"
         const val UNKNOWN_CONTEXT = "(unknown)"
         private const val DB_NAME = "pocket_ssh.db"
-        private const val DB_VERSION = 1
+        private const val DB_VERSION = 2
         private const val DEFAULT_MIN_COUNT = 2
+
+        /** Per-`(context, prev)` group rows kept by [prune] regardless of age. */
+        private const val DEFAULT_KEEP_TOP = 10
+
+        /** A bigram outside the per-group top is pruned after going unused this long. */
+        private const val DEFAULT_MAX_AGE_MILLIS = 10L * 24 * 60 * 60 * 1000
     }
 }

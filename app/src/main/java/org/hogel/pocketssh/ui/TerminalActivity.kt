@@ -674,6 +674,9 @@ class TerminalActivity : AppCompatActivity() {
 
         setupTerminalView()
         setupTerminalScrollRouting()
+        // Trim stale learned suggestions once per launch off the UI thread so
+        // the bigram table can't grow without bound.
+        Thread { bigramStore.prune() }.start()
         // Render an initial pass with whatever defaults resolve at specifity 0
         // (the "always" group). The FAB and per-app rows fill in once the
         // service binds and reports useTmux / lastTitle.
