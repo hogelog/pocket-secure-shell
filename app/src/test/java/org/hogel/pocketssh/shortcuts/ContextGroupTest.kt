@@ -183,7 +183,7 @@ class ContextGroupTest {
     fun `bundled defaults match expected groups when nothing is configured`() {
         val defaults = ShortcutStore.defaultContextGroups()
         val names = defaults.map { it.name }
-        assertEquals(listOf("always", "tmux", "claude"), names)
+        assertEquals(listOf("always", "tmux", "claude", "codex"), names)
 
         val resolvedTmuxClaude = defaults.resolve(inTmux = true, currentContext = "claude")
         // claude (specifity 2) + tmux (1) + always (0) all contribute somewhere.
