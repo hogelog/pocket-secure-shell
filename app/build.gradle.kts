@@ -214,10 +214,10 @@ dependencies {
     implementation("com.google.android.material:material:1.14.0")
     implementation("androidx.activity:activity-ktx:1.13.0")
     implementation("androidx.biometric:biometric:1.1.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.10.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.11.0")
     // Sentry is debug-only — release builds ship without the SDK so the app
     // makes no telemetry phone-home in production.
-    debugImplementation("io.sentry:sentry-android:8.43.2")
+    debugImplementation("io.sentry:sentry-android:8.44.1")
 
     // Pinned to stabilize dependency locking: AGP's data binding transforms
     // resolve kotlin-stdlib-common at build time, but `--write-locks` doesn't
