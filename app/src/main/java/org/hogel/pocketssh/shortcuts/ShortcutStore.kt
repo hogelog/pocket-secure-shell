@@ -96,6 +96,18 @@ class ShortcutStore(context: Context) {
                     Shortcut("^J", "^J"),
                 ),
             ),
+            // Same fixed control bytes as claude — codex's TUI uses ESC to
+            // interrupt, Shift-Tab to cycle approval modes, and ^J for a
+            // newline in multi-line input, none of which the tracker can learn.
+            ContextGroup(
+                name = "codex",
+                contexts = listOf("codex"),
+                shortcuts = listOf(
+                    Shortcut("ESC", "\\e"),
+                    Shortcut("⇧Tab", "{S-TAB}"),
+                    Shortcut("^J", "^J"),
+                ),
+            ),
         )
 
         internal fun encodeContextGroups(groups: List<ContextGroup>): JSONArray {
