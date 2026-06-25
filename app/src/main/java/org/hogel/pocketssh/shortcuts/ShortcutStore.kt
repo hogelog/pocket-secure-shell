@@ -83,14 +83,29 @@ class ShortcutStore(context: Context) {
                 swipeLeft = Shortcut("⬅️", "{TMUX-PREFIX}p"),
                 swipeRight = Shortcut("➡️", "{TMUX-PREFIX}n"),
             ),
-            // Control-byte payloads only (ESC, Shift-Tab, ^J): the bigram
-            // tracker can't observe control sequences (it poisons the line on
-            // the first byte `< 0x20`), so they have to stay as fixed buttons.
-            // Plain-text tokens are surfaced by the tracker from real usage.
+            // ESC / Shift-Tab / ^J are control-byte payloads the bigram tracker
+            // can't observe (it poisons the line on the first byte `< 0x20`), so
+            // they have to stay as fixed buttons. `/` opens the slash-command
+            // menu and is pinned too so it's one tap from a fresh prompt.
+            // Other plain-text tokens are surfaced by the tracker from real use.
             ContextGroup(
                 name = "claude",
                 contexts = listOf("claude"),
                 shortcuts = listOf(
+                    Shortcut("/", "/"),
+                    Shortcut("ESC", "\\e"),
+                    Shortcut("⇧Tab", "{S-TAB}"),
+                    Shortcut("^J", "^J"),
+                ),
+            ),
+            // Same fixed buttons as claude — codex's TUI uses ESC to interrupt,
+            // Shift-Tab to cycle approval modes, ^J for a newline in multi-line
+            // input, and `/` to open its slash-command menu.
+            ContextGroup(
+                name = "codex",
+                contexts = listOf("codex"),
+                shortcuts = listOf(
+                    Shortcut("/", "/"),
                     Shortcut("ESC", "\\e"),
                     Shortcut("⇧Tab", "{S-TAB}"),
                     Shortcut("^J", "^J"),
