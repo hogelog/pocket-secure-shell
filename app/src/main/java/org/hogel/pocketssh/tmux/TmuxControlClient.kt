@@ -228,6 +228,12 @@ class TmuxControlClient(
         return "new-window\n".toByteArray(Charsets.US_ASCII)
     }
 
+    /** Build a `kill-window` command for [windowId] (e.g. `@13`). */
+    fun killWindow(windowId: String): ByteArray {
+        enqueueCommand(Pending.Other)
+        return "kill-window -t $windowId\n".toByteArray(Charsets.US_ASCII)
+    }
+
     /** Build a `refresh-client -C` reporting the client size. A control client
      *  has no usable tty size, so without this tmux keeps the session at its
      *  80x24 default and every pane renders for the wrong width. */

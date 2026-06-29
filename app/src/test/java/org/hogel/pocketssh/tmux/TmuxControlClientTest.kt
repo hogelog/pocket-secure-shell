@@ -282,4 +282,10 @@ class TmuxControlClientTest {
         assertTrue(cmd.startsWith("list-windows -F "))
         assertTrue(cmd.contains("#{window_id}\t#{window_index}"))
     }
+
+    @Test
+    fun `killWindow targets the requested window id`() {
+        val cmd = String(client.killWindow("@13"), Charsets.US_ASCII)
+        assertEquals("kill-window -t @13\n", cmd)
+    }
 }
