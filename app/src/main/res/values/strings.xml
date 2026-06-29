@@ -195,6 +195,9 @@
     <string name="window_new">New window</string>
     <string name="window_new_label">+</string>
     <string name="window_tab_label">%1$d: %2$s</string>
+    <string name="window_close_title">Close window</string>
+    <string name="window_close_message">Close \"%1$s\"?</string>
+    <string name="window_close_confirm">Close</string>
 
     <string name="diag_dump_title">Diagnostic dump</string>
     <string name="diag_dump_copy">Copy</string>

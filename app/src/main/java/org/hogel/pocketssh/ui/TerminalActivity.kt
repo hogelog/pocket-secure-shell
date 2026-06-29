@@ -857,7 +857,7 @@ class TerminalActivity : AppCompatActivity() {
             val label = getString(R.string.window_tab_label, window.index, window.name)
             val tab = makeAuxButton(label) { selectTmuxWindow(window.index) }
             tab.setOnLongClickListener {
-                closeTmuxWindow(window.index)
+                confirmCloseTmuxWindow(label) { closeTmuxWindow(window.index) }
                 true
             }
             // Tabs are denser than the shortcut bar — smaller font, tighter
@@ -897,7 +897,7 @@ class TerminalActivity : AppCompatActivity() {
             val label = getString(R.string.window_tab_label, window.index, window.name)
             val tab = makeAuxButton(label) { service?.selectWindow(window.id) }
             tab.setOnLongClickListener {
-                service?.killWindow(window.id)
+                confirmCloseTmuxWindow(label) { service?.killWindow(window.id) }
                 true
             }
             tab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
@@ -948,6 +948,15 @@ class TerminalActivity : AppCompatActivity() {
         val prefix = readTmuxPrefixByte()
         writeToSsh(byteArrayOf(prefix))
         writeToSsh(":kill-window -t $index\r".toByteArray(Charsets.UTF_8))
+    }
+
+    private fun confirmCloseTmuxWindow(label: String, onConfirm: () -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.window_close_title)
+            .setMessage(getString(R.string.window_close_message, label))
+            .setPositiveButton(R.string.window_close_confirm) { _, _ -> onConfirm() }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     /**
