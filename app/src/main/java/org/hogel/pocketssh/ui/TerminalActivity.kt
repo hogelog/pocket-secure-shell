@@ -856,6 +856,10 @@ class TerminalActivity : AppCompatActivity() {
         for (window in windows) {
             val label = getString(R.string.window_tab_label, window.index, window.name)
             val tab = makeAuxButton(label) { selectTmuxWindow(window.index) }
+            tab.setOnLongClickListener {
+                confirmCloseTmuxWindow(label) { closeTmuxWindow(window.index) }
+                true
+            }
             // Tabs are denser than the shortcut bar — smaller font, tighter
             // padding, and a 32dp minimum so a 10-window strip still fits
             // without horizontal scroll on a phone.
@@ -892,6 +896,10 @@ class TerminalActivity : AppCompatActivity() {
         for (window in windows) {
             val label = getString(R.string.window_tab_label, window.index, window.name)
             val tab = makeAuxButton(label) { service?.selectWindow(window.id) }
+            tab.setOnLongClickListener {
+                confirmCloseTmuxWindow(label) { service?.killWindow(window.id) }
+                true
+            }
             tab.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             tab.setPadding(tabHorizontalPaddingPx, 0, tabHorizontalPaddingPx, 0)
             tab.minWidth = tabMinDimensionPx
@@ -933,6 +941,22 @@ class TerminalActivity : AppCompatActivity() {
     private fun openNewTmuxWindow() {
         val prefix = readTmuxPrefixByte()
         writeToSsh(byteArrayOf(prefix, 'c'.code.toByte()))
+    }
+
+    /** Close tmux window [index] without relying on tmux prefix key bindings. */
+    private fun closeTmuxWindow(index: Int) {
+        val prefix = readTmuxPrefixByte()
+        writeToSsh(byteArrayOf(prefix))
+        writeToSsh(":kill-window -t $index\r".toByteArray(Charsets.UTF_8))
+    }
+
+    private fun confirmCloseTmuxWindow(label: String, onConfirm: () -> Unit) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.window_close_title)
+            .setMessage(getString(R.string.window_close_message, label))
+            .setPositiveButton(R.string.window_close_confirm) { _, _ -> onConfirm() }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
     }
 
     /**

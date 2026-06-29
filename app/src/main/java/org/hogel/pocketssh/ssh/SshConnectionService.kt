@@ -612,6 +612,20 @@ class SshConnectionService : Service() {
         }
     }
 
+    /** Close a tmux window (control mode; prefix keys don't work). */
+    fun killWindow(windowId: String) {
+        val out = session?.stdin ?: return
+        val cmd = controlClient?.killWindow(windowId) ?: return
+        sshWriteExecutor.execute {
+            try {
+                out.write(cmd)
+                out.flush()
+            } catch (e: Exception) {
+                Log.e(TAG, "kill-window error", e)
+            }
+        }
+    }
+
     /** Point keystrokes at the pane the user is viewing. */
     fun setInputPane(paneId: String) {
         controlClient?.setInputPane(paneId)
